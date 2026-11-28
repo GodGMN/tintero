@@ -59,12 +59,7 @@ class Family(unittest.TestCase):
         q = ChatTemplate(QWEN)
         self.assertTrue(q.qwen)
         self.assertTrue(q.keeps_thinking)
-        for path in ("serve/glm5_chat_template.jinja", "tools/ds4/chat_template.jinja", "tools/mm3/chat_template.jinja",
-                     "tools/glm_chat_template.jinja"):
-            with self.subTest(path):
-                t = ChatTemplate(ROOT / path)
-                self.assertFalse(t.qwen)
-                self.assertFalse(t.keeps_thinking)
+        self.assertFalse(ChatTemplate(ROOT / "serve/glm5_chat_template.jinja").qwen)
 
     def test_past_thinking_sent_back_is_rendered_as_written(self):
         """The web chat sends an answer's reasoning back for a Qwen3.x model: the history then holds the turn as the
@@ -151,12 +146,10 @@ class ServerClose(unittest.TestCase):
         think_end = tok.encode("</think>", parse_special=True)[0]
         produced = tok.encode("Done.")
         self.assertIsNone(svc._closed_as_rendered(tok.encode("Hello"), produced, think_end))   # (no open <think>\n)
-        for model in ("glm5", "deepseek", "minimax"):
-            with self.subTest(model):
-                svc, tok = self.svc(model)
-                end = tok.encode("</think>", parse_special=True)[0]
-                ids = tok.encode("x<think>\n", parse_special=True)
-                self.assertIsNone(svc._closed_as_rendered(ids, tok.encode("Done."), end))
+        svc, tok = self.svc("glm5")
+        end = tok.encode("</think>", parse_special=True)[0]
+        ids = tok.encode("x<think>\n", parse_special=True)
+        self.assertIsNone(svc._closed_as_rendered(ids, tok.encode("Done."), end))
 
 
 if __name__ == "__main__":

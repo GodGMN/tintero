@@ -17,7 +17,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # a venv, as installs run: maya.py started from a system Python hands itself to ./maya.sh (os.execve)
       - name: Python packages
         run: |
           python -m venv "$RUNNER_TEMP/venv"
@@ -30,7 +29,5 @@ jobs:
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
-      - name: Decode comparison and web client tests
-        run: |
-          "$RUNNER_TEMP/venv/bin/python" tests/ik2_compare_decode_test.py
-          node --test tools/test_*.mjs
+      - name: Decode comparison
+        run: '"$RUNNER_TEMP/venv/bin/python" tests/ik2_compare_decode_test.py'

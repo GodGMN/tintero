@@ -69,7 +69,7 @@ mkdir "$context/tools" "$context/tests"
 cp "$root/tests"/ik2*.py "$context/tests/"
 cp -R "$root/ref" "$context/ref"
 cp -R "$root/tools"/ik2* "$context/tools/"
-for name in strata_tokenizer gguf_reader gguf_writer maya_quants maya_names ablate_fit needle_bench inkling2_gguf; do
+for name in strata_tokenizer gguf_reader gguf_writer maya_names ablate_fit needle_bench inkling2_gguf; do
     cp "$root/tools/$name.py" "$context/tools/"
 done
 cp "$root/third_party/ggml/LICENSE" "$context/LICENSE.ggml"

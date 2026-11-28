@@ -63,6 +63,26 @@ The server speaks the OpenAI chat and responses APIs and the Anthropic messages 
 
 To pick the card, set `CUDA_VISIBLE_DEVICES` before the command.
 
+### Native Windows startup
+
+Use a 64-bit Python 3.10+ and a Visual Studio developer prompt with CUDA, CMake and Ninja on PATH. From the checkout, build the engine and prepare the Python environment.
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build --target tintero
+py -3 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r docker\requirements.txt
+```
+
+Download the GGUF in your chosen [preset](PRESETS.md) and export its tokenizer as above. For example, set up the `cuda-24gb-fp4.json` preset with the `IQ4_NL` GGUF.
+
+```bat
+.venv\Scripts\python.exe tools\strata_tokenizer.py --gguf models\Inkling-2-Mini-IQ4_NL.gguf --out ik2 --chat-template tools\ik2\chat_template.jinja
+START-MAYA.bat --config docs\inkling2-mini\cuda-24gb-fp4.json --port 8085
+```
+
+The launcher starts the API with the specified config. It resolves the preset's `build/tintero` to `build/tintero.exe` on Windows. For a different build or model location, set the `exe`, `args` and `tokenizer` paths in your copy of the preset.
+
 ## Configs
 
 All 4 are in [`docs/inkling2-mini/`](inkling2-mini/).

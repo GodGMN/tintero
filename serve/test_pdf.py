@@ -8,19 +8,14 @@ route tests only need the mock engine (no GPU, no pack).
 from __future__ import annotations
 
 import base64
-import json
 import shutil
 import sys
 import unittest
-import urllib.error
-import urllib.request
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import pdf as pdfmod    # noqa: E402
-from serve.frontend import ChatTemplate    # noqa: E402
-from serve.server import ByteTokenizer, MockEngine, Service, serve    # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 POPPLER = shutil.which("pdftotext") and shutil.which("pdftoppm")
@@ -134,53 +129,6 @@ class MissingPoppler(unittest.TestCase):
         with mock.patch.object(shutil, "which", return_value=None):
             r = pdfmod.extract(_pdf([b""]), want_images=False, text_limit=LIMIT)
         self.assertIn("no text layer", r["error"]["message"])
-
-
-class Route(unittest.TestCase):
-    """POST /pdf (now also /attach) against the mock engine (no GPU): the guards a dashboard route keeps, and the JSON that comes
-    back for the page to attach.  The mock service has no vision, so scanned PDFs error the way a model without
-    images should see them."""
-
-    def setUp(self):
-        tok = ByteTokenizer()
-        self.svc = Service(MockEngine(tok, "</think>\n\nhello", max_context=32768), tok,
-                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        self.httpd = serve(self.svc, port=0)
-        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
-
-    def tearDown(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-
-    def post(self, body: bytes, ctype: str = "application/pdf"):
-        r = urllib.request.Request(self.base + "/pdf", method="POST",
-                                   headers={"Content-Type": ctype}, data=body)
-        try:
-            with urllib.request.urlopen(r, timeout=30) as resp:
-                return resp.status, json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            with e:
-                return e.code, json.loads(e.read())
-
-    def test_text_pdf_round_trip(self):
-        s, j = self.post(_pdf([_lines(WORDS)]))
-        self.assertEqual(s, 200)
-        self.assertEqual(j["kind"], "text")
-        self.assertIn("lazy dog, line 2", j["text"])
-
-    def test_wants_pdf_bytes_not_json(self):
-        s, j = self.post(b"{}", "application/json")
-        self.assertEqual((s, "application/octet-stream" in j["error"]["message"]), (415, True))
-
-    def test_says_what_it_cannot_read(self):
-        s, j = self.post(b"MZ\x90\x00\x03" + bytes(range(256)) * 4)
-        self.assertEqual(s, 200)                               # (the error is the result's, for the page to toast)
-        self.assertIn("Windows program", j["error"]["message"])
-
-    def test_scanned_pdf_errors_when_the_model_reads_no_pictures(self):
-        s, j = self.post(_pdf([b""]))
-        self.assertEqual(s, 200)                               # (the error is the result's, for the page to toast)
-        self.assertIn("no text layer", j["error"]["message"])
 
 
 if __name__ == "__main__":

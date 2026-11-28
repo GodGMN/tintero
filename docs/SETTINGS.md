@@ -14,15 +14,13 @@ with that API's own error instead, never with a finish reason a client would tak
 | OpenAI chat completions | the text already sent stands; then a `data: {"error": {"type": "server_error", ...}}` chunk and `data: [DONE]` (no `finish_reason` chunk) | HTTP 422, `{"error": {"type": "engine_error", "code": "engine_error", "message": ..., "partial_text": ...}}` |
 | Anthropic messages | the text already sent stands; then `event: error` (`api_error`), no `message_delta` with a `stop_reason` | HTTP 422, `{"type": "error", "error": {"type": "engine_error", "message": ..., "partial_text": ...}}` |
 | Responses | `response.failed` with `error.code` "server_error" | HTTP 422, the response with status "failed", `error.code` "engine_error" and `error.partial_text` |
-| Maya's model API (`/api/chat`, `/api/generate`) | a last line `{"error": ...}`, no `done: true` line | HTTP 422 with `{"error": ..., "error_type": "engine_error", "partial_text": ...}` |
 
 The documented finish reasons have no "error" value (OpenAI's are stop / length / tool_calls / content_filter /
 function_call, Anthropic's end_turn / max_tokens / stop_sequence / tool_use / pause_turn / refusal), so a new one
 would be read as a normal end by some clients; the error forms above are the ones every client handles (the OpenAI and
 Anthropic SDKs raise an error on them). A request that is not streamed gets 422, not a 5xx: the SDKs send a 5xx,
 408, 409 or 429 again by themselves, which would run the same long answer once more without the client seeing the
-error. Its error carries what the answer had written before it: `partial_text` (and `partial_reasoning` - Maya's
-model API: `partial_thinking` - when it was still thinking), less the last few tokens the loop guard still held
+error. Its error carries what the answer had written before it: `partial_text` and `partial_reasoning` when it was still thinking, less the last few tokens the loop guard still held
 back. The message says how many tokens the answer had and why it stopped: after a GPU's fault on DeepSeek, the call
 that failed and the position in the context (what the engine prints on the console as it ends); otherwise that the
 reason is in the engine's log. After a GPU's fault the engine ends, and the next request starts a fresh one.
@@ -33,18 +31,17 @@ Two config settings shape the thinking, and only one of them counts tokens:
 
 | Setting | What it is |
 |---|---|
-| `"thinking_budget"` | the cap on the thinking, in tokens (32768 by default; 8192 for GLM-5.3-Flash Maya-XS; 0 = none). Past it the server closes the thinking at the next sentence or line end and the answer starts. Settings > Chat defaults > Thinking budget changes it without a restart. GLM-5.3 (744B): a request that asks for Max itself gets up to 65536, as far as its room keeps 32768 for the answer, while the budget is the default (none set, or 32768); another value, or any value saved on the dashboard, applies at every level |
-| `"reasoning_effort"` | the thinking level a request gets when it names none: a word (`none`, `auto`, `low`, `medium`, `high`, `xhigh`, `max`). DeepSeek-V4.1 also takes a number from 1 to 100 (`42` or `"42"`), its own effort level: it is written into the prompt as a hint to the model, not a token cap |
+| `"thinking_budget"` | The token cap for reasoning. Inkling-2-Mini defaults to 0, which leaves reasoning uncapped. |
+| `"reasoning_effort"` | The thinking level when a request leaves it out. Inkling accepts `none`, `auto`, `low`, `medium`, `high`, `xhigh` and `max`. |
 
-Inkling-2-Mini has no thinking cap by default. Set `thinking_budget` in the preset, on the dashboard,
-or in the request body (including SDK `extra_body`). Chat Completions, Responses and Messages accept
-a per-request override. Zero disables the cap for that request. Inkling counts reasoning tokens
+Set `thinking_budget` in the preset or POST a JSON body such as `{"budget":2048}` to `/api/thinking-budget`.
+Chat Completions, Responses and Messages also accept a per-request override. Zero disables the cap for that request.
+Inkling counts reasoning tokens
 and opens an answer segment at the cap. If the output limit binds first, the server reserves
 a quarter of it (up to 1024 tokens) for the answer. Inkling reads the cap from the top-level JSON setting, outside `env`.
 Anthropic's `thinking.budget_tokens` selects an effort level. The hard cap uses `thinking_budget`.
 
-A `reasoning_effort` the model does not take (a number above 100 for DeepSeek, any number for the other models) stops
-the start before the model loads, with a message that points to `thinking_budget`.
+An invalid `reasoning_effort` in the preset stops startup before the model loads.
 
 ## The loop guard
 
@@ -113,7 +110,7 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   ends it, and so does the engine's EOS token there (a call cut off by it is incomplete, not failed).
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
-token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,
+token 1,763: repeats dropped, a short repetition penalty`); `/metrics` marks that request (Loop guard,
 on hover what it did) and counts the loops since the start, as do `/metrics` (`loop_guard`) and
 `/metrics/prometheus` (`maya:loop_guard_*_total`; the notes across turns: `[maya] loop guard: `bash` 3 times with the
 same arguments and result: a note after it`, `maya:loop_guard_tool_repeats_total`).
@@ -127,8 +124,8 @@ thinkingmachines' [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkl
 its own engine, `tintero` (`src/ik2`; CUDA on Linux, Ampere on), from unsloth's GGUFs
 ([unsloth/Inkling-2-Small-GGUF](https://huggingface.co/unsloth/Inkling-2-Small-GGUF): UD-Q4_K_XL, UD-Q3_K_XL) read in
 place. The routed experts sit in pinned host memory (~323 GiB for UD-Q4_K_XL, ~260 GiB for UD-Q3_K_XL) with a cache of
-them in VRAM; one request at a time, text only. `maya.py` does not set it up yet: docs/INKLING2.md section 6 has the
-tokenizer folder and the run config, then `python serve/server.py --engine maya --config ik2.json`.
+them in VRAM. It serves one text request at a time. See [Inkling-2-Small](INKLING2.md#6-phase-2-the-engine-tintero) for the
+tokenizer and run config.
 
 **Defaults**: temperature 1.0, top-p 1.0 (its card and files name none); the thinking level Auto, the template's own
 (0.9 - "high"). The template is thinkingmachines' (`tools/ik2/chat_template.jinja`), which takes every level by name:

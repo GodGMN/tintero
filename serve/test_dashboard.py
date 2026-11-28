@@ -1,9 +1,4 @@
-"""serve/test_dashboard.py - what the web app's Settings and Monitor ask the server for: the context size (its range, a
-reload, the 503 while it reloads, the run config it is saved into), the engine's measured context cost, and the report.
-Against the mock engine (no GPU, no pack).
-
-    python -m unittest serve.test_dashboard -v
-"""
+"""HTTP tests for context changes and metrics with a scripted engine."""
 from __future__ import annotations
 
 import json
@@ -19,8 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (CONTEXT_MIN, MAYA_VERSION, ByteTokenizer, MockEngine, Service, StrataEngine, serve,  # noqa: E402
-                          trained_context_ds4)
+from serve.server import CONTEXT_MIN, MAYA_VERSION, ByteTokenizer, MockEngine, Service, StrataEngine, serve
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -85,28 +79,6 @@ class Dashboard(unittest.TestCase):
         self.assertGreaterEqual(j["max"], 32768)
         self.assertEqual(j["tested"], 262144)                   # (the GLM engine's: the dashboard warns past it)
 
-    def test_deepseek_context_range(self):
-        """A DeepSeek pack: the context its ds4.txt says the model was trained for is the top (V4.1-Flash: 1M), and its
-        engine is tested up to it."""
-        pack = Path(self.tmp.name) / "maya-ds4"
-        pack.mkdir()
-        (pack / "ds4.txt").write_text("hidden_size 4096\nmax_position_embeddings 1048576\nsliding_window 128\n")
-        self.assertEqual(trained_context_ds4(pack), 1048576)
-        self.assertIsNone(trained_context_ds4(Path(self.tmp.name) / "nowhere"))
-        (Path(self.tmp.name) / "bad").mkdir()
-        (Path(self.tmp.name) / "bad" / "ds4.txt").write_text("max_position_embeddings many\n")
-        self.assertIsNone(trained_context_ds4(Path(self.tmp.name) / "bad"))
-        self.svc.trained_context = trained_context_ds4(pack)
-        self.engine.info = dict(self.engine.info, engine_kind="ds4")
-        s, _, b = self.req("GET", "/api/context")
-        j = json.loads(b)
-        self.assertEqual((j["max"], j["tested"]), (1048576, 1048576))
-        s, _, _ = self.req("POST", "/api/context", {"max_context": 1048576})
-        self.assertEqual(s, 202)
-        self.assertEqual((self.wait_reload()["context"]), 1048576)
-        s, _, _ = self.req("POST", "/api/context", {"max_context": 2097152})   # (past what it was trained for)
-        self.assertEqual(s, 400)
-
     def test_reload_changes_the_context_and_saves_it(self):
         s, _, b = self.req("POST", "/api/context", {"max_context": 65536})
         self.assertEqual(s, 202)
@@ -116,11 +88,9 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(args[args.index("--max-context") + 1], "65536")
         self.assertEqual(json.loads(self.cfg.read_text())["env"]["MAYA_GLM_RAM_GB"], "20")   # the rest kept
         self.assertGreaterEqual(j["load_s"], 0.3)       # (how long that load took: the page's estimate of the next)
-        # the setup's own size is kept for the Models page's "Reset to the setup's values", through later reloads
-        self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
         self.req("POST", "/api/context", {"max_context": 16384})
         self.wait_reload()
-        self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
+        self.assertEqual(json.loads(self.cfg.read_text())["args"][-1], "16384")
 
     def test_inkling_context_reload_and_rollback_with_two_caches(self):
         slots = 2
@@ -144,16 +114,6 @@ class Dashboard(unittest.TestCase):
         result = self.wait_reload()
         self.assertEqual((result["reload"]["state"], result["context"]), ("failed", 49152))
         self.assertEqual(json.loads(self.cfg.read_text())["args"], args)
-
-    def test_metrics_say_whether_deepseek_drafts(self):
-        # DeepSeek's engine does not say it drafts with DSpark: the server does (the Monitor's Speculation), and only
-        # for a DeepSeek config
-        s, _, b = self.req("GET", "/metrics")
-        self.assertNotIn("dspark", json.loads(b)["engine"])
-        for on in (True, False):
-            self.svc.dspark = on
-            s, _, b = self.req("GET", "/metrics")
-            self.assertIs(json.loads(b)["engine"]["dspark"], on)
 
     def test_metrics_list_the_drafters_that_run(self):
         # the Monitor's Speculation: the drafters this engine runs with, per model engine; empty = drafting is off
@@ -233,26 +193,15 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(cm.exception.code, 415)
         cm.exception.close()
 
-    def test_report_leaves_secrets_out(self):
-        s, h, b = self.req("GET", "/api/report")
-        text = b.decode()
-        self.assertEqual(s, 200)
-        self.assertIn("Project Maya", text)
-        self.assertIn("MAYA_GLM_RAM_GB", text)   # (a config's settings under the names users see)
-        self.assertNotIn("secret", text)
-
     def test_token_count_matches_the_prompt(self):
         msgs = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hello there"},
                 {"role": "assistant", "content": "Hi! How can I help?"}, {"role": "user", "content": "count me"}]
-        s, _, b = self.req("POST", "/api/tokens", {"messages": msgs, "reasoning_effort": "high"})
+        s, _, b = self.req("POST", "/tokenize", {"messages": msgs, "reasoning_effort": "high"})
         j = json.loads(b)
         from serve.frontend import openai_to_messages
         m, tools, kw = openai_to_messages({"messages": msgs, "reasoning_effort": "high"})
         ids, _, _ = self.svc.prepare(m, tools, kw)
-        self.assertEqual((s, j["tokens"], j["approximate"]), (200, len(ids), False))
-        s, _, b = self.req("POST", "/api/tokens", {"messages": msgs + [{"role": "user", "content": [
-            {"type": "text", "text": "and this"}, {"type": "image_url", "image_url": {"url": "data:,"}}]}]})
-        self.assertTrue(json.loads(b)["approximate"])
+        self.assertEqual((s, j["tokens"]), (200, ids))
 
     def test_tokenize_and_detokenize(self):
         """POST /tokenize and /detokenize in llama.cpp's and vLLM's forms: a text's ids (its special tokens' text as
@@ -335,55 +284,6 @@ class Dashboard(unittest.TestCase):
         self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
         s, _, b = self.req("GET", "/metrics")
         self.assertEqual(json.loads(b)["requests"][0]["api"], "openai")
-
-
-class Port(unittest.TestCase):
-    """The dashboard's Port: saved into the config and Maya's start script for it; a busy, a reserved or the same port is
-    refused with nothing saved; only Maya's own page may move the server.  (No restart here: maya.py did not start this
-    server, so the port applies from the next start - the restart itself is maya.py's RESTART_EXIT, tested there.)"""
-
-    def setUp(self):
-        os.environ.pop("MAYA_RESTART_ON_UPDATE", None)
-        Dashboard.setUp(self)
-        self.script = Path(self.tmp.name) / "run-maya-test.bat"
-        self.script.write_bytes(b"@echo off\r\npython maya.py --config " + str(self.cfg).encode() + b" --port 8080 %*\r\n")
-
-    tearDown = Dashboard.tearDown
-    req = Dashboard.req
-
-    @staticmethod
-    def free_port():
-        import socket
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
-
-    def test_saved_and_reported(self):
-        s, _, b = self.req("GET", "/api/port")
-        info = json.loads(b)
-        self.assertEqual((s, info["port"], info["restarts"]), (200, self.httpd.server_address[1], False))
-        n = self.free_port()
-        s, _, b = self.req("POST", "/api/port", {"port": n})
-        self.assertEqual((s, json.loads(b)), (202, {"port": n, "restarts": False}))
-        self.assertEqual(json.loads(self.cfg.read_text())["port"], n)
-        self.assertEqual(json.loads(self.cfg.read_text())["args"][-1], "32768")   # (the rest kept)
-        self.assertIn(f"--port {n} %*\r\n".encode(), self.script.read_bytes())   # (CR LF kept)
-
-    def test_refused_with_nothing_saved(self):
-        import socket
-        busy = socket.socket()
-        busy.bind(("127.0.0.1", 0))
-        busy.listen(1)
-        try:
-            for port in (busy.getsockname()[1], 80, self.httpd.server_address[1], "x"):
-                s, _, b = self.req("POST", "/api/port", {"port": port})
-                self.assertEqual(s, 400, port)
-        finally:
-            busy.close()
-        s, _, _ = self.req("POST", "/api/port", {"port": self.free_port()}, {"Origin": "http://elsewhere.example"})
-        self.assertEqual(s, 403)
-        self.assertNotIn("port", json.loads(self.cfg.read_text()))
-        self.assertIn(b"--port 8080 %*", self.script.read_bytes())
 
 
 class ContextCost(unittest.TestCase):
@@ -683,319 +583,6 @@ class NvmlPids(unittest.TestCase):
             launcher.kill()
             launcher.wait()
             launcher.stdout.close()
-
-
-class Offline(unittest.TestCase):
-    """The page works without the internet: its scripts, styles, fonts and icons are all in serve/web (Preact, htm
-    and Lucide vendored with their notices) - nothing is loaded from another host."""
-    WEB = ROOT / "serve" / "web"
-
-    def test_nothing_loaded_from_the_network(self):
-        import re
-        remote = re.compile(r"""(?:\b(?:src|href|action)\s*=\s*|\burl\(\s*|\bfrom\s+|\bimport\s*\(\s*|"""
-                            r"""\bfetch\(\s*|@import\s+|new\s+(?:WebSocket|EventSource|Worker)\(\s*)["'`]?(?:https?:)?//""",
-                            re.I)
-        found = []
-        for p in sorted(self.WEB.rglob("*")):
-            if p.suffix not in (".js", ".css", ".html", ".svg", ".webmanifest"):
-                continue
-            for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
-                if remote.search(line) and "w3.org/" not in line:
-                    found.append(f"{p.relative_to(ROOT)}:{n}: {line.strip()[:120]}")
-        self.assertEqual(found, [])
-
-    def test_the_vendored_code_keeps_its_notices(self):
-        self.assertIn("The MIT License", (self.WEB / "preact.js").read_text(encoding="utf-8")[:3000])
-        self.assertIn("Apache License, Version 2.0", (self.WEB / "preact.js").read_text(encoding="utf-8")[:3000])
-        self.assertIn("ISC License", (self.WEB / "LICENSE.lucide.txt").read_text(encoding="utf-8"))
-        self.assertTrue((self.WEB / "fonts" / "OFL.txt").is_file())
-        index = (self.WEB.parent / "web" / "index.html").read_text(encoding="utf-8")
-        self.assertNotIn("fonts.googleapis", index)
-
-
-# the page's own modules in Node (skipped without it), the browser's few globals they touch at load stubbed out
-PAGE_STUBS = """
-const noop = () => {};
-const el = new Proxy({}, {get: (t, k) => (k in t ? t[k] : k === "dataset" || k === "style" ? (t[k] = {})
-  : k === "classList" ? (t[k] = {add: noop, remove: noop, toggle: noop}) : noop)});
-globalThis.matchMedia = () => ({matches: false, addEventListener: noop, addListener: noop});
-globalThis.localStorage = {getItem: () => null, setItem: noop, removeItem: noop};
-globalThis.document = {documentElement: el, body: el, head: el, addEventListener: noop, querySelector: () => null,
-                       createElement: () => el};
-globalThis.window = globalThis; globalThis.addEventListener = noop;
-globalThis.location = {href: "http://x/", hash: "", search: "", pathname: "/"};
-const web = process.argv[2];
-const st = await import(web + "/state.js"), sv = await import(web + "/server.js");
-"""
-
-
-@unittest.skipUnless(__import__("shutil").which("node"), "Node.js is not installed")
-class PageLogic(unittest.TestCase):
-    def node(self, body):
-        import subprocess
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "t.mjs"
-            p.write_text(PAGE_STUBS + body, encoding="utf-8")
-            r = subprocess.run(["node", str(p), (ROOT / "serve" / "web").resolve().as_uri()], capture_output=True,
-                               encoding="utf-8", timeout=60)
-        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
-        return json.loads(r.stdout.strip().splitlines()[-1])
-
-    def test_glm53_keeps_its_own_chat_defaults(self):
-        # GLM-5.3 (744B, "glm-5.3") and GLM-5.3-Flash shared "maya.sampling" before v1.1.59: the 744B gets its own
-        # key, which starts once from what was saved there - Flash's stays as it was, and nothing is lost
-        got = self.node("""
-const mem = new Map();
-globalThis.localStorage = {getItem: (k) => (mem.has(k) ? mem.get(k) : null), setItem: (k, v) => mem.set(k, String(v)),
-                           removeItem: (k) => mem.delete(k), key: (i) => [...mem.keys()][i], get length() { return mem.size; }};
-const read = (k) => JSON.parse(mem.get("maya." + k) || "null");
-const out = {};
-mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.3, system: "Be brief", sys_default: true}));
-st.S.health = {model: "glm-5.3", model_label: "GLM-5.3 (744B) · Maya-XS"};
-mem.set("maya.model", JSON.stringify(st.modelId()));
-out.key744 = st.prefsKey();
-out.migrated = read("sampling_glm53");
-st.loadPrefs(); st.savePrefs({temperature: 0.9});
-out.after744 = read("sampling_glm53").temperature; out.flashKept = read("sampling").temperature;
-mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.5}));
-st.prefsKey();
-out.once = read("sampling_glm53").temperature;              // (only once: never over the 744B's own again)
-st.S.health = {model: "glm-5.3-flash", model_label: "GLM-5.3-Flash · Maya-L"};
-out.keyFlash = st.prefsKey();
-st.S.health = {model: "deepseek-v4.1-flash", model_label: "x"};
-out.keyDs = st.prefsKey();
-// a first start after the update straight on another model: the 744B's copy is made before a switch clears choices
-mem.clear();
-mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.3, system: "Be brief"}));
-mem.set("maya.model", JSON.stringify("glm-5.3|GLM-5.3 (744B) · Maya-XS"));
-st.S.health = {model: "glm-5.3-flash", model_label: "GLM-5.3-Flash · Maya-L"};
-out.switched = st.newModelCheck();
-out.switch744 = read("sampling_glm53");
-console.log(JSON.stringify(out));""")
-        self.assertEqual(got["key744"], "sampling_glm53")
-        self.assertEqual(got["migrated"], {"prefs_v": 3, "temperature": 0.3, "system": "Be brief", "sys_default": True})
-        self.assertEqual((got["after744"], got["flashKept"]), (0.9, 0.3))
-        self.assertEqual(got["once"], 0.9)
-        self.assertEqual((got["keyFlash"], got["keyDs"]), ("sampling", "sampling_deepseek"))
-        self.assertTrue(got["switched"])
-        self.assertEqual(got["switch744"]["system"], "Be brief")                 # (kept: not a sampling choice)
-
-    def test_thinking_pill_covers_the_chosen_level_only(self):
-        # the owner's phone: Low chosen, the fill spanned Off and Low.  Every model's levels, every level: the pill sits
-        # on that level's segment alone
-        got = self.node("""
-const out = {};
-for (const model of ["glm-5.3-flash", "deepseek-v4.1-flash", "minimax-m3.1-flash", "cyber-frost-3.8-ps"]) {
-  st.setFamily(model);
-  out[model] = st.LEVELS.map((l) => [l.id, st.thinkPill(l.id)]);
-}
-console.log(JSON.stringify(out));""")
-        self.assertEqual([lv for lv, _ in got["glm-5.3-flash"]], ["none", "low", "high", "max"])
-        self.assertEqual(len(got["minimax-m3.1-flash"]), 7)
-        for model, levels in got.items():
-            n = len(levels)
-            for i, (lv, pill) in enumerate(levels):
-                with self.subTest(model=model, level=lv):
-                    self.assertEqual((pill["i"], pill["n"]), (i, n))
-                    self.assertAlmostEqual(pill["at"], 100 * i / n)
-                    self.assertAlmostEqual(pill["width"], 100 / n)      # (one segment wide: not from 0 up to it)
-        self.assertEqual(got["glm-5.3-flash"][1][1]["at"], 25)            # Low: the second quarter only
-
-    def test_free_room_a_tensor_parallel_partner_cannot_use_promises_no_experts(self):
-        # a --tp 2 pair: GPU 1 has 9 GB free, GPU 0 (with the drafter) 1 GB - the members hold the same expert slots, so
-        # a restart gives none more; the room is idle, a DSpark block moved there can use it
-        got = self.node("""
-const {freeAdvice} = await import(web + "/monitor.js");
-const G = 2 ** 30, more = (g, b) => Math.max(0, Math.floor(b / (g.parts.pool / g.slots)));
-const where = (gs) => gs.map((g) => "GPU " + g.index).join(" and "), pools = () => "the pools";
-const m = (index, free, room, drafter) => ({index, dev: index, free, tp_room: room, tp_group: 0, slots: 1000,
-                                           parts: {pool: 10 * G, drafter}});
-const pair = [m(0, G, G, G), m(1, 9 * G, G, 0)], both = [m(0, 5 * G, 5 * G, 0), m(1, 7 * G, 5 * G, 0)];
-const plain = [{index: 0, dev: 0, free: 5 * G, slots: 1000, parts: {pool: 10 * G}}];
-console.log(JSON.stringify({
-  pair: freeAdvice([pair[1]], pair, {engine_kind: "ds4"}, where, pools, more),
-  mm3: freeAdvice([pair[1]], pair, {engine_kind: "mm3"}, where, pools, more),
-  both: freeAdvice(both, both, {engine_kind: "ds4"}, where, pools, more),
-  plain: freeAdvice(plain, plain, {engine_kind: "ds4"}, where, pools, more)}));""")
-        self.assertNotIn("restart gives the pools", got["pair"])
-        self.assertIn("GB of GPU 1 sit idle", got["pair"])
-        self.assertIn("MAYA_DS4_DRAFT_DEV", got["pair"])
-        self.assertNotIn("MAYA_DS4_DRAFT_DEV", got["mm3"])
-        # (both have room: 5 GB each grows the pair's slots once - 400 experts, not 800; GPU 1's other 2 GB idle)
-        self.assertIn("are free: a restart gives the pools about 400 more experts.", got["both"])
-        self.assertIn("GB of GPU 1 sit idle", got["both"])
-        self.assertTrue(got["plain"].endswith("GB of GPU 0 are free: a restart gives the pools about 400 more experts."))
-
-    def test_speculation_says_off_waiting_or_the_acceptance(self):
-        # the Monitor's Speculation, three states: off (no drafter, or the request asked for none: "off" in the field and
-        # in the figure), drafting on with nothing drafted yet ("-", never a fake 0%), drafting on with drafts (accepted of
-        # drafted, %) - live from the STAT draft counts, else the last answer's
-        got = self.node("""
-const now = 1000;
-const eng = (modes) => ({speculation: modes});
-const live = (o) => ({state: "generating", elapsed_s: 5, ...o});
-const stat = (o) => ({now: {time: now - 1, ...o}});
-const v = (m) => sv.speculationView(m, now);
-const out = {
-  none: v({engine: eng([]), live: {state: "idle"}, requests: []}),
-  noneLive: v({engine: eng([]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
-  specOne: v({engine: eng(["MTP"]), live: live({spec_off: true}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
-  lastSpecOne: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{spec_off: true, drafts_offered: 0, drafts_accepted: 0}]}),
-  idleNever: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: []}),
-  idleZero: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{drafts_offered: 0, drafts_accepted: 0}]}),
-  idleNull: v({engine: eng(["DFlash2"]), live: {state: "idle"}, requests: [{drafts_offered: null, drafts_accepted: null}]}),
-  liveNone: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
-  liveNoKeys: v({engine: eng(["Lookup"]), live: live({}), tiers: stat({vram_hit: 1}), requests: []}),
-  liveOld: v({engine: eng(["MTP"]), live: live({elapsed_s: 5}), tiers: {now: {time: now - 100, draft_acc: 9, draft_off: 10}}, requests: []}),
-  beforeThis: v({engine: eng(["MTP"]), live: live({elapsed_s: 2}), tiers: {now: {time: now - 20, draft_acc: 9, draft_off: 10}}, requests: []}),
-  live: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 124, draft_off: 200}), requests: []}),
-  liveAllKept: v({engine: eng(["DSpark", "Lookup"]), live: live({}), tiers: stat({draft_acc: 50, draft_off: 50}), requests: []}),
-  liveRatio: v({engine: eng(["DSpark"]), live: live({}), tiers: stat({drafts: 0.5}), requests: []}),
-  zeroKept: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 40}), requests: []}),
-  last: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{drafts_offered: 1200, drafts_accepted: 600}]}),
-  oldServer: v({engine: {}, live: {state: "idle"}, requests: []}),
-};
-console.log(JSON.stringify(out));""")
-        for k in ("none", "noneLive", "specOne"):                              # state 1: off, in the field and the figure
-            self.assertEqual((got[k]["state"], got[k]["name"], got[k]["text"]), ("off", "off", "off"), k)
-        self.assertEqual((got["lastSpecOne"]["state"], got["lastSpecOne"]["name"], got["lastSpecOne"]["text"]),
-                         ("off", "MTP", "off"))                                # (idle: the engine's drafter, the last answer had none)
-        for k in ("idleNever", "idleZero", "idleNull", "liveNone", "liveNoKeys", "liveOld", "beforeThis"):
-            self.assertEqual((got[k]["state"], got[k]["text"]), ("waiting", "\u2014"), k)   # state 2: on, nothing drafted yet
-        self.assertEqual(got["idleNever"]["name"], "MTP")
-        self.assertEqual(got["idleNull"]["name"], "DFlash2")
-        self.assertEqual((got["live"]["state"], got["live"]["text"], got["live"]["name"]), ("kept", "62% (124 of 200)", "MTP"))
-        self.assertEqual(got["liveAllKept"]["text"], "100% (50 of 50)")
-        self.assertEqual(got["liveAllKept"]["name"], "DSpark + Lookup")
-        self.assertEqual(got["liveRatio"]["text"], "50%")                       # (an engine that gives the share only)
-        self.assertEqual(got["zeroKept"]["text"], "0% (0 of 40)")                  # a real 0%: drafted, none kept
-        self.assertEqual(got["last"]["text"], "50% (600 of 1,200)")
-        self.assertEqual(got["oldServer"]["state"], "none")
-
-    def test_experts_on_the_ssd_have_their_bytes_like_the_other_tiers(self):
-        got = self.node("""
-const n = {vram_used: 300, ram_used: 500, vram_gb: 12.5, ram_gb: 20.25, disk_gb: 31.4};
-const ds = {vram_used: 40, ram_used: 100, cpu_n: 400, vram_gb: 9, ram_gb: 25, disk_gb: 75.5};
-console.log(JSON.stringify({glm: sv.tierShares(n, {experts: 2000}), none: sv.tierShares({vram_used: 5, ram_used: 5}, {experts: 10}),
-  ds4: sv.tierShares(ds, {engine_kind: "ds4"}), full: sv.tierShares({vram_used: 10, ram_used: 0, disk_gb: 0}, {experts: 10})}));""")
-        self.assertEqual((got["glm"]["vu"], got["glm"]["ru"], got["glm"]["disk"]), (300, 500, 1200))
-        self.assertEqual((got["glm"]["vramGb"], got["glm"]["ramGb"], got["glm"]["diskGb"]), (12.5, 20.25, 31.4))
-        self.assertEqual((got["ds4"]["total"], got["ds4"]["disk"], got["ds4"]["diskGb"]), (440, 300, 75.5))
-        self.assertIsNone(got["none"]["diskGb"])                                   # (an engine that reports no bytes: the count alone)
-        self.assertEqual((got["full"]["disk"], got["full"]["diskGb"]), (0, 0))
-
-    def test_qwen_file_reads_are_named_for_what_they_count_and_the_ssd_tip_needs_ssd_only_experts(self):
-        # Mercury's Monitor, Qwen3.8 UD-IQ2_XS on 1x V100: 13,199 experts in VRAM, 11,377 in pinned RAM, none on the SSD
-        # alone - but 8.23 experts a token read from the model file; the card said "From SSD" and advised more RAM
-        got = self.node("""
-const m = await import(web + "/monitor.js");
-const q = {engine_kind: "qwen", experts: 24576}, n = {vram_used: 13199, ram_used: 11377, disk: 8.23, vram_hit: 0.93};
-const g = {experts: 2000}, gn = {vram_used: 300, ram_used: 500, disk: 4, vram_hit: 0.9};
-console.log(JSON.stringify({set: m.tierSet(q).find((x) => x.key === "disk"), glmSet: m.tierSet(g).find((x) => x.key === "disk"),
-  homes: m.tierTip(n, q, {disk: sv.tierShares(n, q).disk}),
-  ssdOnly: m.tierTip({...n, ram_used: 9000}, q, {disk: sv.tierShares({...n, ram_used: 9000}, q).disk}),
-  glm: m.tierTip(gn, g, {disk: sv.tierShares(gn, g).disk}), stale: m.tierTip(gn, g, {disk: 1200, stale: true}),
-  cfCpu: m.tierTip({vram_used: 100, ram_used: 24476, disk: 0, vram_hit: 0.3}, q, {disk: 0})}));""")
-        self.assertEqual(got["set"]["label"], "From the model file")
-        self.assertIn("page cache or SSD", got["set"]["sub"])
-        self.assertEqual(got["glmSet"]["label"], "From SSD")                    # (GLM's own reads: unchanged)
-        self.assertEqual(got["homes"], "")                                      # every expert has a home: no "more RAM"
-        self.assertTrue(got["ssdOnly"].startswith("Many experts are read from the SSD"))   # 2,377 on the SSD alone
-        self.assertTrue(got["glm"].startswith("Many experts are read from the SSD"))
-        self.assertEqual(got["stale"], "")
-        self.assertTrue(got["cfCpu"].startswith("Most experts run on the CPU"))
-
-    def test_hy4_its_two_levels_its_own_settings_and_its_monitor_tiers(self):
-        # Hy4-Flash ("hy4-flash", maya-hy4): the two levels it is made for (High, Off), High the default; chat settings of
-        # its own; a level of another model's goes to High; the Monitor: the CPU lane and the n-gram table's
-        # read, the experts in VRAM from its INFO line - no SSD tier, no promotions
-        got = self.node("""
-const m = await import(web + "/monitor.js"), lib = await import(web + "/lib.js"), tc = await import(web + "/turbo-core.js");
-const out = {family: st.familyOf("hy4-flash"), others: ["glm-5.3-flash", "glm-5.3", "deepseek-v4.1-flash", "minimax-m3.1-flash",
-  "cyber-frost-3.8-ps", "qwen3.8-flash-next", ""].map((x) => st.familyOf(x))};
-st.setFamily("hy4-flash");
-st.S.health = {model: "hy4-flash"};
-out.levels = st.LEVELS; out.dflt = st.DEFAULTS.thinking; out.titles = st.thinkTitles(); out.key = st.prefsKey();
-out.nearest = ["none", "auto", "low", "medium", "high", "xhigh", "max"].map((l) => st.levelFor(l));
-out.pills = st.LEVELS.map((l) => st.thinkPill(l.id).i);
-out.fastest = tc.fastestThinking(st.THINKING);
-out.name = lib.modelName("hy4-flash"); out.logo = lib.modelLogo("hy4-flash"); out.catalogLogo = lib.modelLogo("Hy4-Flash · Maya-XS");
-const eng = {engine_kind: "hy4", experts: "6144", vram_slots: "1900"}, n = {vram_hit: 0.31, cpu: 5.52, engram_ms: 0.42};
-out.set = m.tierSet(eng).map((x) => [x.key, x.label]); out.shares = sv.tierShares(n, eng);
-out.tip = m.tierTip(n, eng, {disk: 0}); out.calm = m.tierTip({...n, vram_hit: 0.9}, eng, {disk: 0});
-out.sets = ["ds4", "mm3", "qwen", "glm-fast"].map((k) => m.tierSet({engine_kind: k}).map((x) => x.key).join());
-// its INFO line as the server parses it (numbers): tensor parallel (every expert's slices on the members: all in VRAM),
-// a layer split with all of them in VRAM, one GPU with the CPU lane (Jupiter's V100, Maya-XS)
-const info = (line) => Object.fromEntries(line.split(" ").slice(1).map((kv) => kv.split("=")).map(([k, v]) => [k, /^-?\\d+$/.test(v) ? +v : v]));
-const lay = {tp: "INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=32768 vram_gb=49.40 dspark=0 mtp=1 experts=20992 vram_slots=20992",
-             one: "INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=32768 vram_gb=31.40 dspark=0 mtp=1 experts=20992 vram_slots=8118"};
-out.lay = Object.fromEntries(Object.entries(lay).map(([k, l]) => [k, sv.tierShares({vram_hit: 1, cpu: 0}, info(l))]));
-out.layTip = m.tierTip({vram_hit: 1, cpu: 0, engram_ms: 0.07}, info(lay.tp), {disk: 0});
-console.log(JSON.stringify(out));""")
-        self.assertEqual(got["family"], "hy4")
-        self.assertEqual(got["others"], ["glm", "glm", "deepseek", "minimax", "qwen", "qwen", "glm"])   # (as before)
-        self.assertEqual([(lv["id"], lv["name"]) for lv in got["levels"]], [("none", "Off"), ("high", "High")])
-        self.assertEqual((got["dflt"], got["key"], got["fastest"]), ("high", "sampling_hy4", "none"))
-        self.assertEqual(sorted(got["titles"]), ["high", "none"])
-        self.assertEqual(got["titles"]["none"], "No thinking: it answers right away (Hy4's no_think)")
-        self.assertEqual(got["nearest"], ["none", None, None, "high", "high", "high", "high"])   # (None: its default, High)
-        self.assertEqual(len(got["pills"]), 2)
-        self.assertEqual((got["name"], got["logo"], got["catalogLogo"]),
-                         ("Hy4 Flash", {"src": "web/logo-hy4.svg", "mono": False}, {"src": "web/logo-hy4.svg", "mono": False}))
-        self.assertTrue((ROOT / "serve" / "web" / "logo-hy4.svg").is_file())
-        self.assertEqual(got["set"], [["cpu", "On the CPU"], ["engram_ms", "N-gram memory"]])
-        self.assertEqual(got["shares"], {"vu": 1900, "ru": 4244, "total": 6144, "disk": 0, "vramGb": None, "ramGb": None,
-                                         "diskGb": None})
-        self.assertTrue(got["tip"].startswith("Most experts run on the CPU"))
-        self.assertEqual(got["calm"], "")
-        # (maya-hy4 before the fix said vram_slots=0 in tensor parallel: the bar all RAM beside a 100% VRAM hit)
-        self.assertEqual({k: (v["vu"], v["ru"], v["total"], v["disk"]) for k, v in got["lay"].items()},
-                         {"tp": (20992, 0, 20992, 0), "one": (8118, 12874, 20992, 0)})
-        self.assertEqual(got["layTip"], "")
-        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo", "ram_fetch,disk",
-                                       "ram_fetch,disk,promo"])                   # (the other engines': unchanged)
-
-    def test_about_has_the_support_line_always_and_the_update_card_none(self):
-        # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold
-        # violet; no row under an update's button; the sidebar's heart stays
-        web = ROOT / "serve" / "web"
-        js = (web / "settings.js").read_text(encoding="utf-8")
-        line = js[js.index("const SupportLine"):js.index("function UpdateCard")]
-        body = line.split("<span>", 1)[1].split("</span></p>", 1)[0].replace('${" "}', " ")
-        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", body))
-        self.assertEqual(text, "I build Maya because I believe everyone should have access to great local AI. If you enjoy "
-                               "what I'm building, consider supporting me. Every little bit helps keep the project alive "
-                               "and growing. ❤️")
-        self.assertRegex(line, r'<a class="support-link" href=\$\{SUPPORT_URL\} target="_blank" rel="noopener"\s+'
-                               r'title="[^"]*">supporting me</a>')
-        self.assertNotIn('name="heart"', line)                               # (no second heart before the text)
-        card = js[js.index("function UpdateCard"):js.index("\n}\n", js.index("function UpdateCard"))]
-        self.assertNotIn("SupportLine", card)
-        self.assertIn("<${UpdateCard}/>\n    <${SupportLine}/>", js)               # (About: always, under the update)
-        css = (web / "settings.css").read_text(encoding="utf-8")
-        rule = re.search(r"\.set-support \.support-link \{([^}]*)\}", css).group(1)
-        self.assertIn("font-weight: 700", rule)
-        self.assertIn("color: var(--st-accent-text)", rule)
-        self.assertEqual(len(re.findall(r"--st-accent-text:\s*#", (web / "tokens.css").read_text(encoding="utf-8"))), 2)
-        self.assertIn("heart-link", (web / "sidebar.js").read_text(encoding="utf-8"))   # (the sidebar's heart stays)
-
-    def test_context_slider_reaches_each_models_own_top(self):
-        # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to
-        # 1M), the size a config has kept as a stop of its own
-        got = self.node("""
-const r1m = {min: 4096, max: 1048576}, r256 = {min: 4096, max: 262144};
-st.S.ctxInfo = {...r1m, context: 131072};
-console.log(JSON.stringify({m1: sv.ctxStopsIn(r1m, 131072), m256: sv.ctxStopsIn(r256, 131072, 100000),
-                            settings: sv.ctxStops(), none: sv.ctxStopsIn(null, 1),
-                            win: sv.ctxHint(16384, {now: 131072, win: 32768, whole: true, ram: sv.GLM_KV_BYTES}),
-                            past: sv.ctxHint(131072, {now: 131072, win: 32768, whole: true, ram: sv.GLM_KV_BYTES})}));""")
-        self.assertEqual((got["m1"][0], got["m1"][-1]), (4096, 1048576))
-        self.assertEqual(got["m1"], got["settings"])                     # (the same stops as Settings > Model's)
-        self.assertEqual(got["m256"][-1], 262144)
-        self.assertIn(100000, got["m256"])
-        self.assertEqual(got["none"], [])
-        self.assertEqual(got["win"], "Up to 32K the whole cache stays in VRAM.")
-        self.assertTrue(got["past"].startswith("≈ 1.5 GB of RAM for the context"), got["past"])
 
 
 if __name__ == "__main__":

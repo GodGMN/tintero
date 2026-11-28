@@ -12,7 +12,7 @@ RUN cmake -S . -B /build -G Ninja -DSTRATA_BUILD_TESTS=OFF \
 
 FROM scratch AS bundle
 COPY --from=build /build/tintero /build-ik2/tintero
-COPY VERSION LICENSE* maya.py setup.py maya.sh /
+COPY VERSION LICENSE* maya.py maya.sh setup.sh /
 COPY third_party/ggml/LICENSE /LICENSE.ggml
 COPY third_party/ciru/LICENSE /LICENSE.ciru
 COPY third_party/ciru/NOTICE /NOTICE.ciru

@@ -10,7 +10,6 @@ import tempfile
 import unittest
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
-import maya  # noqa: E402
 import maya_names as N  # noqa: E402
 
 
@@ -32,12 +31,6 @@ class Names(unittest.TestCase):
         self.assertEqual(out["env"], {"MAYA_GLM_CPU_LANE": "8", "MAYA_GLM_SPLIT": "0", "HIP_VISIBLE_DEVICES": "0"})
         self.assertEqual(cfg["env"]["MAYA_GLM_SPLIT"], "0")     # (the copy written; the config in memory unchanged)
         self.assertEqual(N.env_out({"exe": "x"}), {"exe": "x"})
-
-    def test_setup_reads_and_writes_configs_so(self):
-        p = Path(tempfile.mkdtemp()) / "maya-x.json"
-        p.write_text(json.dumps({"env": {"MAYA_GLM_RESERVE_MB": "3072"}}))
-        self.assertEqual(maya.read_json(p)["env"], {"MAYA_GLM_RESERVE_MB": "3072"})
-        self.assertEqual(N.shown("STRATA_GLM_RESERVE_MB"), "MAYA_GLM_RESERVE_MB")
 
     def test_both_names_and_lookup(self):
         self.assertEqual(N.both_names("MAYA_DS4_READ_ORDER"), ("MAYA_DS4_READ_ORDER", "STRATA_DS4_READ_ORDER"))
@@ -69,7 +62,7 @@ class EngineSeesMayaOnlySettings(unittest.TestCase):
         from serve.server import child_env
         p = Path(tempfile.mkdtemp()) / "maya-x.json"
         p.write_text(json.dumps({"exe": "x", "env": {"MAYA_DS4_READ_ORDER": "arrival", "MAYA_EXPERT_STAGERS": "3"}}))
-        cfg = maya.read_json(p)
+        cfg = N.env_in(json.loads(p.read_text(encoding="utf-8")))
         out = subprocess.run([_sys.executable, "-c", "import os;print(os.environ.get('MAYA_DS4_READ_ORDER'),"
                               "os.environ.get('MAYA_EXPERT_STAGERS'),os.environ.get('STRATA_DS4_READ_ORDER'))"],
                              env=child_env(cfg), capture_output=True, text=True, timeout=60).stdout.split()

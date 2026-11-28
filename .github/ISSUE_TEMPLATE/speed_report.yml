@@ -1,11 +1,11 @@
 name: Speed report
-description: Share how fast Maya runs on your PC
+description: Share how fast Tintero runs on your PC
 labels: ["speed-report"]
 body:
   - type: markdown
     attributes:
       value: |
-        Run `./maya.sh --bench` (Windows: `START-MAYA.bat --bench`), then `./maya.sh --report`, and attach `maya-report.txt`. It includes the benchmark.
+        Include the benchmark command, the preset and the measured rates. Remove API keys from any command or log you share.
   - type: input
     id: gpus
     attributes:
@@ -35,7 +35,7 @@ body:
     id: model
     attributes:
       label: Model and quant
-      placeholder: GLM-5.3-Flash, Maya-S (or GLM-5.3, UD-IQ2_M)
+      placeholder: Inkling-2-Mini, IQ4_NL
     validations:
       required: true
   - type: input
@@ -61,7 +61,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: Maya version
+      label: Tintero version
     validations:
       required: true
   - type: textarea
@@ -72,5 +72,5 @@ body:
   - type: textarea
     id: report
     attributes:
-      label: maya-report.txt
-      description: Drag the file here, or paste its text.
+      label: Benchmark output
+      description: Attach the output or paste the measured results.
