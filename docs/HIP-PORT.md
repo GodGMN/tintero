@@ -1,14 +1,282 @@
 # Inkling 2 Mini on gfx1100
 
-On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. [Live service](#live-service-on-prometheus) · [Choose a cache profile](#named-fp4-profiles) · [FP8 and FP4 quality](#same-slots-different-kv-precision) · [Decode and prefill measurements](#full-model-measurements-at-393216-reserved-tokens)
+`tintero` runs Inkling-2-Mini on AMD RDNA 3 and RDNA 3.5 GPUs through HIP. The 24 GiB profile keeps the quantized text weights and every routed expert resident, then scales the KV cache from FP8 down to FP4 to fit long conversations.
 
-### Which GPUs and models can run it?
+For benchmark results and the commands used to collect them, see the [measurement history](#measurement-history).
 
-`tintero` implements the Inkling 2 Mini architecture. Its HIP executable contains code for AMD target `gfx1100`, with 32-lane waves and RDNA3 matrix instructions. Prometheus's 24 GiB RX 7900 XTX is the card tested here. The 20 GiB RX 7900 XT and 16 GiB RX 7900 GRE share the target, but neither fits the measured 23.64 GiB full-context image configuration. A smaller configuration needs its own fit and correctness tests. The RX 7800 XT uses `gfx1101` and needs a separately supported build. The NVIDIA CUDA build has its own kernels. [AMD GPU specifications](https://rocm.docs.amd.com/en/docs-7.2.3/reference/gpu-arch-specs.html)
+## Which GPUs and models can run it?
 
-Both Prometheus engines load the same `Inkling-2-Mini-IQ4_NL.gguf` text weights. The FP8 Maya profile stores attention keys and values from previously read tokens in E4M3, an 8-bit floating-point format. The FP4 profiles use block-scaled E2M1 for the global cache and E4M3 for sliding-window attention. The previous llama.cpp service stored its keys and values in Q4_0. On the 7900 XTX, Maya unpacks E4M3 in software for attention. The separate image encoder loads the same `mmproj-F16.gguf` with either backend. These settings can change the numerical results even with identical text weights.
+The HIP executable is built for Wave32 AMD targets. CMake accepts `gfx1100`, `gfx1101`, `gfx1102`, `gfx1103`, `gfx1150` and `gfx1151`, and rejects other architectures. The 24 GiB full-context profile was measured on an RX 7900 XTX (`gfx1100`). The 20 GiB RX 7900 XT and 16 GiB RX 7900 GRE share that target but do not fit the measured 23.64 GiB image at 393,216 positions; a smaller context or cache profile needs its own fit and correctness checks. The RX 7800 XT is `gfx1101` and needs an explicit build for that target.
 
-## Live service on Prometheus
+Both the HIP and CUDA builds read the same GGUF text weights. The FP8 profile stores attention keys and values from previously read tokens in E4M3. The FP4 profiles use block-scaled E2M1 for the global cache and E4M3 for sliding-window attention. On `gfx1100`, Maya unpacks E4M3 in software for attention because the card has no native FP8 math. A separate image encoder reads `mmproj-F16.gguf` with either backend. Changed KV precision can change numerical results even when the text weights are identical.
+
+## Build the HIP engine
+
+You need Linux, ROCm with HIP and hipBLAS (the release image uses ROCm 7.2), CMake 3.24 or newer, Ninja, a C++20 compiler, and Python 3.10 or newer for the tokenizer and tests. Compiling needs the ROCm toolchain but not a GPU. The device tests do need a supported card.
+
+```sh
+git clone https://github.com/GodGMN/tintero
+cd tintero
+export ROCM="${ROCM:-/opt/rocm}"
+cmake -S . -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_HIP=ON -DSTRATA_BUILD_TESTS=OFF \
+  -DCMAKE_PREFIX_PATH="$ROCM" \
+  -DCMAKE_HIP_COMPILER="$ROCM/llvm/bin/clang++" \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100
+cmake --build build-ik2 --target tintero -j"$(nproc)"
+```
+
+The server executable is `build-ik2/tintero`. To build the numerical tests as well, configure with `-DSTRATA_BUILD_TESTS=ON` and add the test targets:
+
+```sh
+cmake -S . -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_HIP=ON -DSTRATA_BUILD_TESTS=ON \
+  -DCMAKE_PREFIX_PATH="$ROCM" \
+  -DCMAKE_HIP_COMPILER="$ROCM/llvm/bin/clang++" \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100
+cmake --build build-ik2 --target tintero ik2_kernels_test ik2_host_ref_test ik2_served_policy_test ik2_dflash2_test -j"$(nproc)"
+```
+
+`CMAKE_HIP_ARCHITECTURES` takes a semicolon-separated list. A build for an RX 7900 XTX and a Strix Halo machine in one executable uses `-DCMAKE_HIP_ARCHITECTURES="gfx1100;gfx1151"`. Select exactly one GPU backend per build directory: `STRATA_ENABLE_HIP=ON` and `STRATA_ENABLE_CUDA=ON` together fail at configure time.
+
+The container build compiles both tested HIP targets and does not need the host's ROCm installation:
+
+```sh
+docker build -f docker/Dockerfile.hip -t tintero:hip .
+```
+
+## Verification
+
+Check the linked executable's code objects and runtime dependencies:
+
+```sh
+"$ROCM"/llvm/bin/llvm-objdump --offloading build-ik2/tintero
+ldd build-ik2/tintero
+```
+
+`llvm-objdump` must list a `gfx1100` code object when that is the configured target. `ldd` must resolve the HIP runtime and hipBLAS from the same ROCm installation.
+
+The host-reference test needs no GPU. It checks packed NVFP4 decoding and the CPU expert path against the independent NumPy/PyTorch reference:
+
+```sh
+python3 tests/ik2_host_ref_fixture.py > ik2-host-ref.bin
+./build-ik2/ik2_host_ref_test < ik2-host-ref.bin
+python3 -m unittest tools.test_hip_compat
+```
+
+The fixture needs `numpy` and `torch`; the compatibility test only checks that every CUDA name compiled by the HIP sources has a mapping in `include/strata/hip_compat/`.
+
+The device suite needs a supported GPU. It covers scalar expert, routing, FP8 and FP16 attention, WMMA tiles, paged KV and NVFP4 paths against numerical references:
+
+```sh
+ctest --test-dir build-ik2 -R '^ik2_kernels_test$' --output-on-failure
+```
+
+You can also run the binary directly with the deployment environment, for example `IK2_KV=fp8 ./build-ik2/ik2_kernels_test`.
+
+### Forced decode comparison
+
+Use identical prompt and forced token IDs in each run. The CLI writes its first raw logit row after consuming the first forced token. For `--gen N` it writes N−1 rows and omits the prompt prediction. The comparator checks expected byte counts and reports top-1 agreement, mean/median/max KL, and the position with the largest KL. It reads one vocabulary row at a time.
+
+This example exercises token alignment only. For quality measurements, use tokenized real text and the same cache format, prompt and forced file in both runs.
+
+```sh
+MODEL=models/Inkling-2-Mini-IQ4_NL.gguf  # Set this to your downloaded GGUF.
+printf '%s\n' '101,102,103' > force.csv
+for graph in 0 1; do
+  IK2_KV=fp8 IK2_GRAPH="$graph" IK2_FORCE=force.csv IK2_LOGITS_OUT="graph-$graph.f32" \
+    ./build-ik2/tintero --model "$MODEL" --tokens 1,2 --gen 4 --ctx 256
+done
+python3 tools/ik2_compare_decode.py graph-1.f32 --baseline graph-0.f32 \
+  --prompt-length 2 --gen 4 --vocab 200058
+```
+
+For a comparison against the independent model reference, run the reference on a machine with enough RAM for the GGUF forward pass. Pass the prompt followed by the first N−1 forced tokens. `--logprobs-out` saves only the final array, without intermediate layer dumps.
+
+```sh
+python3 ref/inkling2.py "$MODEL" --tokens 1,2,101,102,103 --logprobs-out ref.npy
+python3 tools/ik2_compare_decode.py graph-1.f32 --ref ref.npy \
+  --prompt-length 2 --gen 4 --vocab 200058
+```
+
+Run throughput measurements separately with logit export disabled. Exporting the full vocabulary adds a device-to-host copy per step.
+
+## Download the model and export the tokenizer
+
+The text engine expects the GGUF that contains the language model. Vision also needs the matching `mmproj` file.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r docker/requirements.txt huggingface_hub
+mkdir -p models ik2
+hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir models
+python3 tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-IQ4_NL.gguf \
+  --out ik2 --chat-template tools/ik2/chat_template.jinja --check
+```
+
+The tokenizer is written to `ik2/tokenizer`. The preset in `docs/inkling2-mini/ik2-mini-gfx1100.json` already points at that directory and at `build-ik2/tintero`.
+
+## Serve the IQ4_NL model on gfx1100
+
+Run the server from the repository root so the preset's relative paths resolve:
+
+```sh
+python3 serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini-gfx1100.json \
+  --host 127.0.0.1 --port 18085
+```
+
+If the model or executable lives elsewhere, copy the preset and change `exe` and the `--model` value in `args`. The preset reserves 393,216 positions for one FP8 conversation with 1,024-token prefill chunks.
+
+Wait for the model to load, then check the OpenAI-compatible endpoint:
+
+```sh
+curl -fsS http://127.0.0.1:18085/v1/models
+curl -fsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"What is the capital of France? Reply in one word."}],"temperature":0,"reasoning_effort":"none","max_tokens":512}'
+curl -NsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"What is 17 plus 25? Reply with digits only."}],"temperature":0,"reasoning_effort":"none","max_tokens":512,"stream":true}'
+```
+
+### Named FP4 profiles
+
+The native `--max-context` argument is the sum of all resident slots. The HTTP `/health` field `max_context` is the limit on one conversation. Set `IK2_CACHE_SLOTS=N` or pass `--cache-slots N`; the engine divides the total context and the global KV budget across those slots.
+
+The default FP8 profile uses 1,024-token prefill chunks. For two resident conversations, keep `IK2_KV=fp8` and set the slot count:
+
+```sh
+python3 - <<'PY'
+import json
+from pathlib import Path
+source = Path("docs/inkling2-mini/ik2-mini-gfx1100.json")
+config = json.loads(source.read_text())
+args = config["args"]
+args[args.index("--max-context") + 1] = "393216"
+config["env"]["IK2_CACHE_SLOTS"] = "2"
+Path("ik2-two-slots.json").write_text(json.dumps(config, indent=2) + "\n")
+PY
+python3 serve/server.py --engine maya --config ik2-two-slots.json --host 127.0.0.1 --port 18085
+```
+
+That gives two 196,608-token conversations. Three or four slots divide the same 393,216 positions evenly. Changing the slot count or the cache profile discards the previous resident caches; check `cache_slots`, `max_context` and `images` on `/health` after a reload.
+
+The packaged gfx1100 image also ships two FP4 profiles that set the slot count, per-slot context and 512-token chunk together. They are generated by `docker/package-ik2-gfx1100.sh`, not stored in the source tree:
+
+| Packaged preset | Slots | Context per slot | Aggregate positions | Allocated per cache |
+|---|---:|---:|---:|---:|
+| `ik2-mini-gfx1100-fp4-2.json` | 2 | 360,448 | 720,896 | 3,291.7 MiB |
+| `ik2-mini-gfx1100-fp4-4.json` | 4 | 176,128 | 704,512 | 1,671.7 MiB |
+
+In the packaged image, select one with `MAYA_IK2_PRESET`. To build an equivalent source preset, set `env.IK2_KV` to `fp4-global`, set `--max-context` to the aggregate positions, and add `--cache-slots N`. The measured capacities and their trade-offs are in the [named-profile measurements](#named-fp4-profile-measurements).
+
+### Concurrent decode for short chat requests
+
+Set `IK2_BATCH` to the maximum number of active requests, from 2 to 32, and use the gfx1100 Maya server. The native `--max-context` is the total across those slots. For 32 conversations of 4,096 tokens each, use `--max-context 131072`. A 256-token prefill chunk keeps the sliding-window allocation small.
+
+```sh
+python3 - <<'PY'
+import json
+from pathlib import Path
+source = Path("docs/inkling2-mini/ik2-mini-gfx1100.json")
+config = json.loads(source.read_text())
+args = config["args"]
+args[args.index("--max-context") + 1] = "131072"
+args[args.index("--chunk") + 1] = "256"
+config["env"]["IK2_BATCH"] = "32"
+Path("ik2-batch.json").write_text(json.dumps(config, indent=2) + "\n")
+PY
+python3 serve/server.py --engine maya --config ik2-batch.json --host 127.0.0.1 --port 8088
+```
+
+The engine advertises `READY 4096 stop multi=32`. The HTTP server queues excess requests. Between decode steps the engine reads at most one prefill chunk, then predicts one token for every ready request. Each sequence keeps its own sampler, position, KV and convolution histories for all 48 visits. Completed and cancelled requests release their slot. Follow-up turns read their full prompt. Leave `IK2_BATCH` unset or set it to 1 for the single-request decoder with prefix reuse.
+
+Concurrent decode requires a single HIP GPU with resident experts and planar Q8 attention projections and output head. Speculative decoding with a drafter uses the single-request server. For the concurrent path, leave `IK2_CACHE_SLOTS` unset or use the same count as `IK2_BATCH`. Increasing the slot count reserves a sliding ring for each slot as well as its global KV. The measured throughput and correctness checks are in the [concurrent decode measurements](#concurrent-decode-measurements).
+
+## Image encoder
+
+Images go through `maya-vision`, a small program built on llama.cpp's `mtmd` library. The encoder can run on the CPU or on the GPU. Upstream llama.cpp has the Inkling 2 image tower since tag `b12590`.
+
+```sh
+git clone --depth 1 -b b12590 https://github.com/ggml-org/llama.cpp third_party/llama.cpp-b12590
+cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_DIR=third_party/llama.cpp-b12590
+cmake --build build-vision --target maya-vision -j"$(nproc)"
+```
+
+The binary is `build-vision/bin/maya-vision`. For the HIP encoder, add the HIP options:
+
+```sh
+cmake -S tools/vision -B build-vision-hip -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_DIR=third_party/llama.cpp-b12590 \
+  -DSTRATA_VISION_HIP=ON -DSTRATA_VISION_HIP_TARGETS=gfx1100 \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DGGML_HIP_NO_VMM=ON
+cmake --build build-vision-hip --target maya-vision -j"$(nproc)"
+```
+
+To serve images, add a `vision` block to the preset and point `exe` at the encoder:
+
+```json
+"vision": {
+  "exe": "build-vision-hip/bin/maya-vision",
+  "model": "models/Inkling-2-Mini-IQ4_NL.gguf",
+  "mmproj": "models/mmproj-F16.gguf",
+  "gpu": true,
+  "resident": true
+}
+```
+
+Download `mmproj-F16.gguf` from the same GGUF repository. On a 24 GiB card the tested resident-HIP configuration uses 256-token prefill chunks; with 1,024-token chunks every expert no longer stays resident at the full context. The CPU encoder keeps the 1,024-token chunk and leaves the GPU to the language model. Vision measurements and encoder comparisons are in the [image encoder history](#image-encoder-on-the-ryzen-5-3600).
+
+## CUDA and HIP differences in the initial scalar port
+
+| Area | Phase 1 implementation |
+| --- | --- |
+| Wave size | The lane index, reductions, and broadcasts assume 32 lanes. The initial port restricted the target to gfx1100; CMake now also accepts the other Wave32 targets listed above. Strata's HIP intrinsics header supplies CUDA-compatible byte selection and warp operations. |
+| Decode and expert MMA | `mma.sync.m16n8k16`, packed-half PTX and Hopper `wgmma` use NVIDIA-specific register layouts. HIP omits those kernels and dispatches the existing scalar products. The CUDA switches keep their original behavior on NVIDIA. |
+| Prefill | The CUDA flash kernel uses `ldmatrix` and pipelined `cp.async`. Its dynamic shared-memory request is 88,064 bytes, above the 65,536-byte gfx1100 workgroup limit. HIP uses the existing tiled logits, softmax and strided batched GEMM path. With FP8 KV it unpacks cache chunks to FP16. This requires more scratch than CUDA flash. |
+| Cache and weights | gfx1100 has no native FP8 or FP4 math. KV uses the software E4M3FN conversion, including subnormals. NVFP4 uses E2M1 nibbles and unsigned block scales. Device compilation selects device-resident IQ lookup tables. |
+| Graphs | Global stream capture maps to HIP global capture. Instantiate and replay use the existing hipGraph wrappers. `IK2_GRAPH=0` runs individual launches for comparison. Replay and captured host/device copies need a card test. |
+| Memory | The compatibility header maps managed allocation, advice, prefetch and the CPU device ID to HIP. Managed KV remains opt-in and checks the device's concurrent managed access attribute. Ordinary resident decode uses device allocations. |
+| Speculative block verification | Block attention and its dense Q8 tile require CUDA MMA. HIP disables the block path. Serving rejects a drafter because the server verifies its proposals with that path. Explicit nonzero requests for `IK2_BLOCK`, `IK2_Q8_TILE`, `IK2_GROUP_MMA`, `IK2_EXPERT_MMA`, `IK2_ATTN_MMA`, `IK2_FLASH` or `IK2_WGMMA` fail at startup. |
+
+## Measurement history
+
+The sections below are the measurement record for the HIP port. They keep the dates, commit hashes, image digests, file hashes, benchmark commands, test-machine paths and hardware notes reported during development. Some commands use paths such as `/work`, `/weight.gguf` and `~/ai/...`, and some use the historical binary name `maya-ik2`; current source builds produce `build-ik2/tintero`. Use the portable guide above for a new deployment. No figure below was re-measured for this document.
+
+### Build and host verification record
+
+The initial HIP build ran in a ROCm 7.2 container limited to four CPUs and 6 GiB of RAM with swap disabled; after the build `/work` reported 21G free. `llvm-objdump --offloading` found gfx1100 code objects in the linked executable, and `llvm-readelf --notes` reported a wavefront size of 32. `ldd` resolved the ROCm 7.2.1 HIP runtime and hipBLAS.
+
+The CPU host-reference fixture matched every packed NVFP4 weight exactly. The C++ expert's maximum absolute difference from the one-expert `Ref.moe` output was `1.90734863e-06`. `python3 -m unittest tools.test_hip_compat` passed. The CUDA 13 managed-memory shims are excluded from HIP.
+
+The first loopback service check used a 32,768-token context and 1,024-token chunks. `GET /v1/models` returned `inkling-2-mini`. The non-streaming chat request returned “Paris”; the streaming request returned “42”, a stop reason and the final SSE `[DONE]`.
+
+### Build on Prometheus without a GPU
+
+The source tree is under `~/ai/build/maya-ik2-hip/src`. The build container mounts its parent at `/work`. The following commands reproduce the environment from a synced source tree.
+
+```sh
+cd ~/ai/build/maya-ik2-hip
+docker run -d --name maya-ik2-hip-build --memory 6g --memory-swap 6g --cpus 4 \
+  -v "$PWD:/work" -w /work --entrypoint sleep ghcr.io/ggml-org/llama.cpp:server-rocm-b11176 infinity
+docker exec -it maya-ik2-hip-build bash
+```
+
+Run the following inside that container.
+
+```sh
+apt-get update -qq
+apt-get install -y --no-install-recommends build-essential cmake ninja-build git python3 python3-pip libomp-dev
+cmake -S src -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_HIP=ON -DSTRATA_BUILD_TESTS=ON \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100
+cmake --build build-ik2 -j4 --target tintero ik2_kernels_test ik2_host_ref_test
+```
+
+The text engine links its own kernels and hipBLAS directly.
+
+### Live service on Prometheus
 
 On 2026-11-23, `hyperion/maya-ik2:gfx1100-service-r4` replaced r3 on port 8085. The image ID is `sha256:b66e209a0315be451a02ccce3f0819f9dee938cec763cb6a4f388285d6493042`. Hyperion still selects `inkling-2-mini`. The default is the stock ggml-org IQ4_NL file, one 393,216-token FP8 cache, GPU vision and medium reasoning. Two and four larger resident FP4 profiles are available at startup. [Profile selection](#named-fp4-profiles) · [Why FP8 remains the default](#same-slots-different-kv-precision)
 
@@ -39,8 +307,8 @@ docker inspect -f '{{.Config.Image}} {{.State.Health.Status}} {{.RestartCount}} 
 curl -fsS http://127.0.0.1:8085/health
 curl -fsS http://127.0.0.1:8085/v1/models
 curl -fsS http://127.0.0.1:8085/api/thinking-budget
-python3 src/tests/ik2_tool_conversations.py http://127.0.0.1:8085
-python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085
+python3 tests/ik2_tool_conversations.py http://127.0.0.1:8085
+python3 tests/ik2_image_answers.py http://127.0.0.1:8085
 ```
 
 In Hyperion select `inkling-2-mini`. The on-node control daemon starts the Compose project in `~/ai/services/inkling-2-mini/`. The separate Hyperion repository still contains its original llama.cpp recipe. Copying that recipe back over the service directory would restore llama.cpp.
@@ -67,7 +335,7 @@ cp service.json.pre-maya-1429 service.json
 docker compose up -d --no-deps --pull never llama
 ```
 
-### Keygen Bench
+#### Keygen Bench
 
 The live service ran the FastTracker II composition benchmark from the same source revision (`f86fa76a3de035078d09b8460ac553336aa4a413`), over the same public Chat Completions route and model alias as the prior llama.cpp run. Both used `xhigh` and a 16,384-token output limit. The native tool-readiness pilot passed before three independent attempts were reserved. The sandbox, visualizer, listener and trusted FT2 renderer were already installed on the controller host. The offline prerequisite check initially lacked the pinned Debian image manifest. Pulling its digest reused the existing base layer.
 
@@ -95,7 +363,7 @@ export HF_HUB_OFFLINE=1 LITELLM_LOCAL_MODEL_COST_MAP=True
 "$state/venv/bin/python" benchmark/score.py profile --out "$work" --workers 1
 ```
 
-## Growing conversations
+### Growing conversations
 
 The single-slot FP8 image profile reserves 393,216 positions with a 1,024-token prefill chunk. The web client now sends Inkling's earlier reasoning back. API clients should retain the complete assistant message, including reasoning and tool calls, and preserve tool IDs when sending results. Changing the system prompt, tools, their order, or the reasoning level can change tokens near the beginning of the rendered history. A rewritten history starts a new prefix.
 
@@ -130,10 +398,10 @@ Run from the Prometheus build directory with the full-context server on port 180
 
 ```sh
 pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-api)
-python3 src/tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" >growth-direct-full.jsonl
+python3 tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" >growth-direct-full.jsonl
 ```
 
-## FP4 global KV experiment on gfx1100
+### FP4 global KV experiment on gfx1100
 
 `IK2_KV=fp4-global` stores 32 consecutive channels as sixteen E2M1 bytes and one FP16 scale. It applies to keys and values of the eight full-attention visits. The 40 sliding-window visits keep E4M3. The text weights are the same stock IQ4_NL GGUF. At 393,216 tokens the global KV payload is 3.375 GiB per conversation, including scales. Conversation state and windowed KV require additional memory.
 
@@ -162,7 +430,7 @@ The binary built from `4d384de` passed the Radeon suite. The independent CPU tes
 
 The extended kernel suite also passed FP4 causal prefill and decode at 392,957 keys against a double-precision sparse-attention calculation. Its four marked keys lay near 5%, 50%, 95% and the final position. The test filled the three trailing padded rows with large values to expose an incorrect attention mask. Across 768 prefill outputs the largest error used 5% of the test tolerance. The 384 decode outputs also passed. Run the same `ik2_kernels_test` command above.
 
-The trial used the service-r3 image with the new executable mounted over `/opt/maya/build-ik2/maya-ik2`. Set `IK2_CACHE_SLOTS=2` in the container environment. In a copy of the host-staged GPU vision preset, set `env.IK2_KV` to `fp4-global`, `--max-context` to twice the per-slot capacity, and `--chunk` to the tested chunk. Start with `MAYA_IK2_PRESET` pointing to the mounted preset. The established all-resident expert requirement and 256 MiB loader reserve remain in force.
+The trial used the service-r3 image with the new executable mounted over `/opt/maya/build-ik2/tintero`. Set `IK2_CACHE_SLOTS=2` in the container environment. In a copy of the host-staged GPU vision preset, set `env.IK2_KV` to `fp4-global`, `--max-context` to twice the per-slot capacity, and `--chunk` to the tested chunk. Start with `MAYA_IK2_PRESET` pointing to the mounted preset. The established all-resident expert requirement and 256 MiB loader reserve remain in force.
 
 ```sh
 python3 tests/ik2_image_answers.py "$URL" --screenshots
@@ -180,7 +448,7 @@ RUN pip install --no-cache-dir numpy==2.2.6
 DOCKER
 ```
 
-### Serving an attention output LoRA
+#### Serving an attention output LoRA
 
 The native engine accepts `--lora FILE.gguf` for GGUF LoRAs with F32 A and B tensors on `blk.N.attn_output.weight`. It checks the base architecture, tensor dimensions, and each A/B pair. Other targets fail at startup. Each visit to an adapted layer adds the low-rank projection before the attention output convolution. The original quantized weights stay on disk and in VRAM. The adapter takes effect at process startup.
 
@@ -189,8 +457,8 @@ For an agent-facing service, copy the stock Maya server preset, append `["--lora
 The regression fixture uses a rank-two adapter with a non-unit scale. A separate Q8_0 model expresses the same projection by copying two rows and flipping the sign of one. The test compares prompt and teacher-forced decode logits and repeats the requests with the adapter disabled. Only the changed matrix is written to a test shard. Run it with the production image's NumPy and a checkout mounted at `/source`:
 
 ```sh
-python3 /source/tests/ik2_lora_reference.py /weights/Inkling-2-Mini-IQ4_NL.gguf /opt/maya/build-ik2/maya-ik2
-python3 /source/tests/ik2_lora_reference.py /weights/Inkling-2-Mini-IQ4_NL.gguf /opt/maya/build-ik2/maya-ik2 --adapter /adapter.gguf
+python3 /source/tests/ik2_lora_reference.py /weights/Inkling-2-Mini-IQ4_NL.gguf /opt/maya/build-ik2/tintero
+python3 /source/tests/ik2_lora_reference.py /weights/Inkling-2-Mini-IQ4_NL.gguf /opt/maya/build-ik2/tintero --adapter /adapter.gguf
 python3 tests/ik2_responses_route.py "$ROUTER" --model "$MODEL_ID" --sdk
 python3 tests/ik2_tool_conversations.py "$ROUTER" --model "$MODEL_ID"
 ```
@@ -208,7 +476,7 @@ python3 paired.py 8086 "$MODEL_ID"
 
 Through the LAN router, all four streaming and non-streaming OpenAI and Anthropic tool conversations completed both calls and used both results. Pi's read-only agent fetched a random code from a local fixture and returned it exactly. A two-color image request also passed. The Responses API continued a stored response with `previous_response_id`. A separate GET by response ID returned HTTP 502 on the shared router and 200 at the service port on the host.
 
-### Adapter-free caption trial on Prometheus
+#### Adapter-free caption trial on Prometheus
 
 The trial starts from stock IQ4_NL. The running Unbound service at handoff added a separate rank-16 adapter. Stock, the adapter, and the offline weight edits are distinct model configurations.
 
@@ -222,11 +490,11 @@ python3 direction-trial/confirm.py 8085 inkling-2-mini stock
 # Repeat both sets against each service with its port, model ID and output label.
 python3 direction-trial/quotes.py 8087 inkling-2-mini-direction caption80
 python3 direction-trial/confirm.py 8087 inkling-2-mini-direction caption80
-python3 src/tests/ik2_gsm8k.py --chat-url http://127.0.0.1:8087 --model-id inkling-2-mini-direction \
+python3 tests/ik2_gsm8k.py --chat-url http://127.0.0.1:8087 --model-id inkling-2-mini-direction \
     --data fp4-overnight/results/gsm8k-test.jsonl --offset 128 --count 8 --max-tokens 1024
-python3 src/tests/ik2_coding.py --url http://127.0.0.1:8087 --model-id inkling-2-mini-direction \
+python3 tests/ik2_coding.py --url http://127.0.0.1:8087 --model-id inkling-2-mini-direction \
     --data fp4-overnight/results/humanevalplus.jsonl --count 4
-python3 src/tests/ik2_tool_conversations.py http://127.0.0.1:8087 --model inkling-2-mini-direction
+python3 tests/ik2_tool_conversations.py http://127.0.0.1:8087 --model inkling-2-mini-direction
 ```
 
 The selected edit (`caption80`) changes eight attention-output matrices and adds a 60,162,592-byte shard. Relative to stock it corrected three captions and lost one that stock had copied. Moving the fit to the start of the answer lost five stock successes and gained none. Applying one shared direction to sixteen matrices tied the selected edit at 22/56, with four gains and two losses. The eight-matrix edit preserves one more stock success and uses half the disk. Unbound copied all 56. These prompts measure one kind of over-refusal. They provide little evidence about how the edits handle other requests.
@@ -262,13 +530,13 @@ python3 "$trial/agent-verify.py"
 pi --offline --list-models inkling
 opencode models | rg prometheus/inkling
 # Prometheus, from ~/ai/build/maya-ik2-hip
-python3 src/tests/ik2_responses_route.py http://127.0.0.1:8079 --direct-url http://127.0.0.1:8087 \
+python3 tests/ik2_responses_route.py http://127.0.0.1:8079 --direct-url http://127.0.0.1:8087 \
     --model inkling-2-mini-direction
 docker top inkling-2-mini-direction -eo pid,args
 docker inspect -f '{{.State.Health.Status}} restarts={{.RestartCount}} oom={{.State.OOMKilled}}' inkling-2-mini-direction
 ```
 
-### Runtime refusal ablation (experimental)
+#### Runtime refusal ablation (experimental)
 
 The caption trial edited eight attention-output matrices and barely moved refusals. Inkling cannot be abliterated
 by editing weights, as measured below. Each attention and MoE output passes through a per-channel time convolution
@@ -354,7 +622,8 @@ A weight edit only stops new writes along the direction. It cannot remove what e
 state, which the runtime projection does at every visit. A portable abliterated Inkling needs a fine-tune that
 learns the runtime behavior, not a weight projection.
 
-### Named FP4 profiles
+
+#### Named FP4 profile measurements
 
 The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` values. Each preset sets the native slot count, per-request context budget and 512-token prefill chunk together. The native `--max-context` argument is the sum of all slots. The HTTP `/health` field `max_context` is the limit on one conversation.
 
@@ -428,7 +697,7 @@ python3 tests/ik2_slot_chats.py "$URL" --slots 4 --depth 175104 --concurrent --i
 
 ```sh
 # From ~/ai/build/maya-ik2-hip on Prometheus
-sh src/docker/package-ik2-gfx1100.sh build-ik2/tintero ik2-tokenizer/tokenizer \
+sh docker/package-ik2-gfx1100.sh build-ik2/tintero ik2/tokenizer \
     hyperion/maya-ik2:gfx1100-service-r4 vision-cpu/bin/maya-vision \
     vision-resident/maya-vision vision-hip/bin/maya-vision
 docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entrypoint python3 \
@@ -438,7 +707,8 @@ docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entry
 
 The first packaged FP4 trial used engine SHA-256 `f08cbeb153f26ea7e1fcf219a1f61fdca50aba7c737b19541d77dadbac822454`. The live release digest is recorded at the top of this log. The packaged Python suites ran 74 tests with three skips and zero failures. All 74 passed on the development host with OpenAI SDK 3.57.0, jsonschema 4.26.0 and Jinja2 3.1.2. The shipped image includes jsonschema and skips the three optional SDK tests. An initial host run used SDK 2.24.0 without jsonschema and failed structured-output and namespace checks. A fresh Python 3.14 environment also lacked Jinja2. The complete run used the existing Python 3.11 SDK environment.
 
-### Repeating the paired checks
+
+#### Repeating the paired checks
 
 Save each server's JSONL output separately. Compare question IDs, expected answers, input token counts and available request-body SHA256s with the following commands. The report lists the specific gains and losses. For MRCR it averages the published prefix-sensitive string similarity. HumanEval+ requires executing the returned programs against the supplied tests before comparing scores.
 
@@ -450,7 +720,7 @@ python3 tests/ik2_compare_quality.py fp8-long-code-score.jsonl fp4-long-code-sco
 
 The first FP4 direct-answer archive run predates request hashing. Its generator used the same message bodies, output limits and JSON encoding, and all paired input token counts matched. Later runs report how many hashes matched.
 
-### Growing stored Responses conversations
+#### Growing stored Responses conversations
 
 `tests/ik2_responses_growth.py` sends only each new batch and the previous response ID. It repeats the same instructions on every request. Each chat receives a lot-to-depot mapping and, in a later batch, a depot-to-number mapping. The final question requires both. It then tests normal-temperature sampling, a same-effort screenshot and a rewritten summary. The cold control explicitly evicts all native slots and replays the complete input, including the model's earlier reasoning. Short runs can repeat each cold control to check reproducibility.
 
@@ -479,7 +749,7 @@ In the full run, two independent Responses chains grew past 345K. FP8 ran them i
 
 Both profiles answered the two-hop questions, read 39% and 43% from the screenshots, and recovered both codes after compaction. The two warm image requests took 3.829 and 4.377 seconds for FP8, and 4.881 and 5.248 seconds for FP4, including medium-effort reasoning. Cold replays of the FP8 lookups at 345,717 and 345,685 tokens produced the same final answers in 360.553 and 357.783 seconds. Both FP4 replays also matched, at 347,149 and 346,270 tokens in 376.699 and 380.167 seconds. Warm and cold reasoning differed on all four comparisons. On FP4, the first lookup generated 252 tokens warm and 345 cold, the second 263 warm and 481 cold.
 
-### Teacher-forced logits on the stock IQ4_NL weights
+#### Teacher-forced logits on the stock IQ4_NL weights
 
 The CPU oracle used `ref/inkling2.py` on the same GGUF and the same 256-token passage. Each Radeon run used the environment in `ik2-mini-gfx1100.json` with the indicated override. The decode test feeds 32 known continuations after a 224-token prompt. Its 32 predictions cover the tail of the prefill passage, so the two rows are overlapping samples.
 
@@ -498,14 +768,14 @@ for kv in fp8 fp4-global; do
         --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
     IK2_KV="$kv" IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="$kv-tg.f32" ./build-ik2/tintero \
         --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
-    oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-pp.f32" --ref heldout-teacher-ref.npy \
+    oracle-env/bin/python tools/ik2_compare_decode.py "$kv-pp.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --prompt-length 256 --prefill
-    oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-tg.f32" --ref heldout-teacher-ref.npy \
+    oracle-env/bin/python tools/ik2_compare_decode.py "$kv-tg.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --prompt-length 224 --gen 33
 done
 ```
 
-### Paired short and long prompts
+#### Paired short and long prompts
 
 The deployment decision uses the stock FP8 model as the control. A two-slot default needs correct cold replays, prefix reuse, working vision, at least 256 MiB of sampled device headroom, and comparable answers on the same short and deep prompts. A reproducible loss of a long-distance record that FP8 recovers is grounds to keep FP8 as the default. The scored tasks below are local paired samples, including when they use public benchmark questions.
 
@@ -539,7 +809,7 @@ On nine short HTTP requests with 129 generated tokens each, median end-to-end th
 python3 tools/ik2_http_bench.py --url "$URL" --max-tokens 129 --repeats 3
 ```
 
-#### Matched capability scores
+##### Matched capability scores
 
 | Task and setting | FP8 | FP4 | Items that changed correctness |
 |---|---:|---:|---|
@@ -564,7 +834,7 @@ Eight further eight-needle MRCR rows contained 23,365 to 60,974 input tokens. Th
 
 On the first medium-effort run of row 1714 (23,365 tokens), FP8 copied the requested seventh article verbatim. FP4 copied the eighth verbatim. Both emitted the correct identifying prefix and finished within 4,096 output tokens. The evaluator records each exact match against the previous articles as well as the official string-similarity score. Use `--require-cached-archive` for the multi-turn MMLU and coding checks to fail immediately if a follow-up rereads its archive.
 
-#### Same slots, different KV precision
+##### Same slots, different KV precision
 
 The deployment comparison uses one FP8 slot and two FP4 slots. To separate precision from slot count, the release image also ran both formats with **two 65,536-token slots**, 512-token prefill chunks, the same stock IQ4_NL file, GPU vision, greedy sampling, medium effort and a 4,096-token output limit. The two configuration files matched after removing `env.IK2_KV`, with SHA-256 `9fd0f224192f6540c5ea12511d3776b85a6f694ad19e5de46b46e72de92c3714` over the remaining settings. All four request hashes matched.
 
@@ -587,9 +857,9 @@ python3 tests/ik2_feasibility.py --url "$URL"
 python3 tests/ik2_kv_quality.py --url "$URL" --mrcr mrcr-short/row-*.json
 ```
 
-## Separate conversation caches
+### Separate conversation caches
 
-### Distinguishing reasoning loops from answer loops
+#### Distinguishing reasoning loops from answer loops
 
 During the first FP4 medium-effort HumanEval/130 run at 348K, the server classified three copies of a 153-token reasoning block as a loop in the final answer. Its next retry stopped with a server notice and no Python function. Inkling marks thinking, text and tool JSON with distinct vocabulary tokens. The server's generic guard had only looked for a closing `</think>` and XML-style tool calls.
 
@@ -624,7 +894,7 @@ The broader CPU regression run covered 527 tests with 22 skips and zero failures
 python -m unittest serve.test_{engine_contract,fair,stop,stream_jobs,response_jobs,response_store,savings,think_budget,tools,logprobs,prompt_memo,server,model_api,multi,inkling2_frontend,loop_guard,responses,responses_tools,responses_schema}
 ```
 
-### Slot selection
+#### Slot selection
 
 Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. With the default decoder, one request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
 
@@ -634,13 +904,13 @@ On the 7900 XTX the old executable lost all 1,799 live tokens of the other chat 
 
 ```sh
 # From /work in maya-ik2-gfx1100, with the usual gfx1100 preset environment
-IK2_KV=fp4-global python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
+IK2_KV=fp4-global python3 tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
     --model /weight.gguf --tokens water.force --fork-slots
-IK2_KV=fp8 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
+IK2_KV=fp8 python3 tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
     --model /weight.gguf --tokens water.force --fork-slots
-IK2_KV=fp4-global IK2_DRAFT_ADAPT=0 IK2_DRAFT_WIDTH=2 python3 src/tests/ik2_prefix_cache.py \
+IK2_KV=fp4-global IK2_DRAFT_ADAPT=0 IK2_DRAFT_WIDTH=2 python3 tests/ik2_prefix_cache.py \
     --engine ./build-ik2/tintero --model /weight.gguf --tokens water.force --draft mtp.safetensors --fork-slots
-IK2_KV=fp4-global python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
+IK2_KV=fp4-global python3 tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
     --model /weight.gguf --tokens water.force --cancel-prefill
 ```
 
@@ -663,19 +933,19 @@ From the Prometheus build directory, start a fresh instance with the indicated s
 
 ```sh
 pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-2)
-python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 2 --depth 196352
+python3 tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 2 --depth 196352
 pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-3)
-python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 3 --depth 24576
-python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 3 --depth 768 --images
+python3 tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 3 --depth 24576
+python3 tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 3 --depth 768 --images
 pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-4)
-python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 4 --depth 98000
+python3 tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 4 --depth 98000
 ```
 
 A separate native test forked one shared history at 1,792 tokens, then resumed both descendants. The first implementation restored only 1,792 of the first descendant's 1,827 live tokens. The engine now preserves that descendant when it restores a checkpoint into an unused or older slot. Both descendants reused all 1,827 tokens and matched eight cold predictions apiece, with plain decode and with the official DSpark drafter. The first cold-control fixture accidentally shared one token with its eviction prompt. The regression now requires zero cached tokens before comparing predictions.
 
 ```sh
-radeon python3 src/tests/ik2_prefix_cache.py --engine ./cache-slots-fork --model /weight.gguf --tokens water.force --fork-slots
-radeon env IK2_DRAFT_ADAPT=0 IK2_DRAFT_WIDTH=2 python3 src/tests/ik2_prefix_cache.py --engine ./cache-slots-fork \
+radeon python3 tests/ik2_prefix_cache.py --engine ./cache-slots-fork --model /weight.gguf --tokens water.force --fork-slots
+radeon env IK2_DRAFT_ADAPT=0 IK2_DRAFT_WIDTH=2 python3 tests/ik2_prefix_cache.py --engine ./cache-slots-fork \
     --model /weight.gguf --tokens water.force --fork-slots --draft mtp.safetensors
 ```
 
@@ -683,25 +953,13 @@ Median single-slot decode before and after introducing slots measured 116.89 and
 
 ```sh
 for exe in full-direct-stop cache-slots-api; do
-    radeon python3 src/tools/ik2_bench.py --engine "./$exe" --model /weight.gguf --depths 512,8192 \
+    radeon python3 tools/ik2_bench.py --engine "./$exe" --model /weight.gguf --depths 512,8192 \
         --ctx 393216 --chunk 1024 --gen 129 --repeats 3 --tokens water.force
 done
 ```
 
-### Concurrent decode for short chat requests
 
-Set `IK2_BATCH` to the maximum number of active requests (2 to 32) and use the gfx1100 Maya server. The native `--max-context` is the total across those slots. For 32 conversations of 4,096 tokens each, use `--max-context 131072`. A 256-token prefill chunk keeps the sliding-window allocation small. Run the following from the repository root with the tokenizer and weights installed.
-
-```sh
-jq '.args = ["--model","models/Inkling-2-Mini-IQ4_NL.gguf","--max-context","131072","--chunk","256"]
-    | .env.IK2_BATCH = "32"' docs/inkling2-mini/ik2-mini-gfx1100.json > ik2-batch.json
-python3 serve/server.py --engine maya --config ik2-batch.json --host 127.0.0.1 --port 8088
-```
-
-The engine advertises `READY 4096 stop multi=32`. The HTTP server queues excess requests. Between decode steps the engine reads at most one prefill chunk, then predicts one token for every ready request. Each sequence has its own sampler, position, KV and convolution histories for all 48 visits. Completed and cancelled requests release their slot. Follow-up turns read their full prompt. Leave `IK2_BATCH` unset or set it to 1 for the original decoder with prefix reuse.
-
-Concurrent decode requires a single HIP GPU with resident experts and planar Q8 attention projections and output head. Speculative decoding with a drafter uses the single-request server. For the concurrent path, leave `IK2_CACHE_SLOTS` unset or use the same count as `IK2_BATCH`. Increasing the slot count reserves a sliding ring for each slot as well as its global KV.
-
+#### Concurrent decode measurements
 On Prometheus, the unmodified `dd139eea` server and the batch server ran the same IQ4_NL weights with FP8 KV, medium reasoning and greedy decoding. Each HTTP request had a short prompt and generated exactly 512 tokens. The client sent one simultaneous group at each concurrency, in the order shown. Aggregate tok/s divides all generated tokens by wall time from the first request until the last response. The last two columns are the median of each request's tokens divided by its own elapsed time, including queueing and prefill. Both servers had a 4,096-token per-request limit and a 256-token prefill chunk. The batch server reserved all 32 slots throughout.
 
 | Concurrent requests | Serial aggregate tok/s | Batch aggregate tok/s | Serial median request tok/s | Batch median request tok/s |
@@ -728,21 +986,21 @@ python3 tests/ik2_gsm8k.py --chat-url http://127.0.0.1:8088 --data gsm8k-test.js
 python3 tests/ik2_tool_conversations.py http://127.0.0.1:8088
 ```
 
-## Multi-turn tool calls on Prometheus
+### Multi-turn tool calls on Prometheus
 
 Run `python3 tests/ik2_tool_conversations.py http://127.0.0.1:PORT` against each listening server. The packaged gfx1100 Maya image (`gfx1100-08aad41`) and the incumbent llama.cpp image (`server-rocm-inkling-1427-r2`, port 8085) each passed all four conversations. On both the OpenAI and Anthropic APIs, in streaming and non-streaming mode, the first assistant turn called the same tool twice with distinct IDs and desk arguments. The client returned results in reverse order. Every final answer associated Larch with VX-731 and Birch with PK-284. The llama.cpp answers sometimes added a heading. Raw responses are in `maya-tools.jsonl` and `llama-tools.jsonl` in the Prometheus build directory.
 
-## Image encoder on the Ryzen 5 3600
+### Image encoder on the Ryzen 5 3600
 
 The installed `mmproj-F16.gguf` works with the node's llama.cpp `b12600` source. The older ggml tree used for the language engine predates the Inkling vision tower. From the build directory on Prometheus, copy the needed source from the existing checkout, then build in the CPU container.
 
 ```sh
 mkdir -p vision-llama-b12600
 git -C ../llama.cpp-b12600 archive b12600 -- CMakeLists.txt cmake src include common ggml tools vendor LICENSE convert_hf_to_gguf.py | tar -x -C vision-llama-b12600
-docker exec -w /work maya-ik2-hip-build cmake -S src/tools/vision -B vision-cpu -G Ninja \
+docker exec -w /work maya-ik2-hip-build cmake -S tools/vision -B vision-cpu -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/work/vision-llama-b12600
 docker exec -w /work maya-ik2-hip-build cmake --build vision-cpu --target maya-vision -j4
-python3 src/tests/ik2_image_answers.py --write-images vision-fixtures
+python3 tests/ik2_image_answers.py --write-images vision-fixtures
 docker run --rm -i --memory 2304m --memory-swap 2304m --cpus 4 -v "$PWD:/work" \
     -v "$HOME/ai/models/inkling-2-mini:/models:ro" --entrypoint /work/vision-cpu/bin/maya-vision \
     ghcr.io/ggml-org/llama.cpp:server-rocm-b11176 --threads 4 \
@@ -755,7 +1013,7 @@ ENCODER
 
 The encoder returned 35 embeddings of width 2,304 for each 256×192 image in 376 and 377 ms. This command ran without GPU devices. The host used four threads.
 
-### Image answers and GPU memory
+#### Image answers and GPU memory
 
 CPU and HIP mtmd and the incumbent llama.cpp server all identified the three left-hand colors after swapping the images under an identical prompt. All three read **39%** from the repository's setup screenshot. The CPU profile used four threads and the full 393,216-token context. Wall times include encoding, prefill and generation. Each row contains one request per server.
 
@@ -771,44 +1029,44 @@ The resident HIP encoder used 984 MiB above its 36 MiB device baseline after war
 Build the encoder in the same CPU-only build container as the CPU version. ROCm's static host objects need PIC on this distribution. The original link failed with `R_X86_64_32 ... can not be used when making a PIE object`. The HIP target now builds with `-fPIC`.
 
 ```sh
-docker exec -w /work maya-ik2-hip-build cmake -S src/tools/vision -B vision-hip -G Ninja \
+docker exec -w /work maya-ik2-hip-build cmake -S tools/vision -B vision-hip -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/work/vision-llama-b12600 -DSTRATA_VISION_HIP=ON \
     -DSTRATA_VISION_HIP_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DGGML_HIP_NO_VMM=ON
 docker exec -w /work maya-ik2-hip-build cmake --build vision-hip --target maya-vision -j4
 # From the Prometheus build directory. The footprint measurement runs with the GPU idle.
 bash ik-vision-footprint.sh
 python3 ik-compare-image-rows.py
-python3 src/tests/ik2_image_answers.py http://127.0.0.1:18085
-python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085
+python3 tests/ik2_image_answers.py http://127.0.0.1:18085
+python3 tests/ik2_image_answers.py http://127.0.0.1:8085
 ```
 
 Comparing all 80,640 embedding values for each color-swap fixture gave CPU/HIP cosine similarities of 0.999370 and 0.999403. Pairing each CPU image with the opposite GPU image gave 0.913765 and 0.912137.
 
-### Image latency on port 8085
+#### Image latency on port 8085
 
 The three screenshot fixtures are 1,480 × 900 pixels and have different image hashes. On a fresh one-slot service (`gfx1100-service-r2`) with a resident HIP encoder, the first screenshot returned 39% in 1.394 s. The next two returned 43% in 0.903 s and 55% in 0.807 s. The CPU service took 13.813 and 13.928 s on the latter two. Its 0.323 s reply to the first used an image embedding retained from the earlier run. Text-prefix cache hits were zero in all six requests.
 
 Reducing the prefill chunk to 256 had a cost for text. In the same HTTP test with 8,207 actual prompt tokens, median cold prefill fell from 3,251.3 tok/s with CPU vision to 1,804.5 with resident HIP vision. Decode measured 109.1 and 107.8 tok/s, respectively. The prompt corpus, chat template, GGUF, generation cap and context reservation were identical. Each median covers three requests with zero cached tokens after a warm-up.
 
 ```sh
-python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085 --screenshots
-python3 src/tools/strata/bench_http.py --url http://127.0.0.1:8085 --api openai \
-    --tokenizer ik2-tokenizer/tokenizer --ctx 641,8321 --prompt-lens 8192 --gen 129 --runs 3 --warmup 1
+python3 tests/ik2_image_answers.py http://127.0.0.1:8085 --screenshots
+python3 tools/strata/bench_http.py --url http://127.0.0.1:8085 --api openai \
+    --tokenizer ik2/tokenizer --ctx 641,8321 --prompt-lens 8192 --gen 129 --runs 3 --warmup 1
 ```
 
 An OpenBLAS CPU experiment encoded the same three images in 27.993, 27.719 and 27.880 s with four threads. The original CPU kernel took 13.855, 13.873 and 14.135 s. These are encoder times before any language-model work. The services keep the original CPU encoder. Run `bash ik-vision-blas-check.sh` in the Prometheus build directory.
 
-The r3 encoder keeps the FP16 projector weights in host memory. mtmd's scheduler transfers weights for HIP operations when reading a picture. At the same 1,024-image-token limit it measured 404 MiB of additional GPU memory, down from 984 MiB. On the three screenshots, its embeddings had cosine similarities of 0.99872, 0.99876 and 0.99819 against CPU, and at least 0.99970 against the resident HIP encoder. Each comparison covered all 1,960,704 values. Run `bash ik-measure-host-vision.sh` with the GPU otherwise idle and `python3 src/tests/ik2_vision_compare.py vision-fixtures/cpu-compile.sve vision-fixtures/host-compile.sve --min-cosine 0.998` from the Prometheus build directory.
+The r3 encoder keeps the FP16 projector weights in host memory. mtmd's scheduler transfers weights for HIP operations when reading a picture. At the same 1,024-image-token limit it measured 404 MiB of additional GPU memory, down from 984 MiB. On the three screenshots, its embeddings had cosine similarities of 0.99872, 0.99876 and 0.99819 against CPU, and at least 0.99970 against the resident HIP encoder. Each comparison covered all 1,960,704 values. Run `bash ik-measure-host-vision.sh` with the GPU otherwise idle and `python3 tests/ik2_vision_compare.py vision-fixtures/cpu-compile.sve vision-fixtures/host-compile.sve --min-cosine 0.998` from the Prometheus build directory.
 
 Four slots needed a 512-token prefill chunk to fit every expert and the encoder. All four cold controls at 97,962 tokens matched their warm replies. Eight alternating follow-ups read 20 new tokens each in 0.197–0.345 s. Cold replays took 51.015–51.114 s. The three screenshots took 1.403, 0.935 and 0.752 s. Device-wide VRAM peaked at 23.67 GiB in the post-request samples, with zero OOM kills. Two slots loaded at 196,608 positions each with 1,024-token chunks and answered the same screenshots in 1.116, 0.916 and 0.662 s. The full two-slot replay was stopped. Three slots use the four-slot chunk size; the earlier three-slot cold controls used CPU vision. On the deployed single-slot profile, the device reported 23.50 GiB after the image checks.
 
 ```sh
-python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085 --screenshots
+python3 tests/ik2_image_answers.py http://127.0.0.1:8085 --screenshots
 # The four-slot result used a separate listener in the same build directory.
-python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --slots 4 --depth 98000 --images --server-pid "$pid"
+python3 tests/ik2_slot_chats.py http://127.0.0.1:18085 --slots 4 --depth 98000 --images --server-pid "$pid"
 ```
 
-## Full-model measurements at 393,216 reserved tokens
+### Full-model measurements at 393,216 reserved tokens
 
 The RX 7900 XTX ran commit `9a0f164` with the installed ggml-org IQ4_NL GGUF, a 1,024-token prefill chunk and E4M3 KV. Every expert stayed on the card. The runner alternated prompt starts, checked that zero input tokens were reused and timed 128 decode steps after the first prediction. Each cell is the median of three requests. Startup is excluded.
 
@@ -826,16 +1084,16 @@ The table cycles the water-passage token IDs. Using contiguous archive text inst
 # From the Prometheus build directory inside the ROCm container.
 radeon() {
     python3 -c 'import json, os, sys
-cfg = json.load(open("src/docs/inkling2-mini/ik2-mini-gfx1100.json"))
+cfg = json.load(open("docs/inkling2-mini/ik2-mini-gfx1100.json"))
 os.execvpe(sys.argv[1], sys.argv[1:], {**os.environ, **cfg["env"]})' "$@"
 }
 bench() {
-    radeon python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+    radeon python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --ctx 393216 --chunk 1024 --gen 129 --repeats 3 "$@"
 }
 bench --tokens water.force --depths 32,512,2048,8192,32768
 bench --tokens water.force --depths 512,8192 --temperature 0.7 --top-p 0.95
-python3 src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl --depths 32768 >needle-32768.request
+python3 tests/ik2_retrieval.py --tokenizer ik2/tokenizer --data gsm8k-test.jsonl --depths 32768 >needle-32768.request
 python3 -c 'from pathlib import Path; ids=Path("needle-32768.request").read_text().splitlines()[0].split()[-1].split(","); Path("natural-8k.ids").write_text(",".join(ids[:8193]))'
 bench --tokens natural-8k.ids --depths 512,8192
 ```
@@ -845,19 +1103,19 @@ On the first 192 GSM8K test questions, this build scored **184/192** with a 4,09
 ```sh
 for offset in 0 96; do
     args="--model /weight.gguf --data gsm8k-test.jsonl --count 96 --offset $offset --max-tokens 4096"
-    oracle-env/bin/python src/tests/ik2_gsm8k.py $args >"gsm-$offset.requests"
+    oracle-env/bin/python tests/ik2_gsm8k.py $args >"gsm-$offset.requests"
     radeon ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 8192 --chunk 1024 \
         <"gsm-$offset.requests" >"gsm-$offset.log"
-    oracle-env/bin/python src/tests/ik2_gsm8k.py $args --score "gsm-$offset.log"
+    oracle-env/bin/python tests/ik2_gsm8k.py $args --score "gsm-$offset.log"
 done
 quiz() {
-    oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer "$@"
+    oracle-env/bin/python tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2/tokenizer "$@"
 }
 quiz | radeon ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 4096 --chunk 512 >mmlu.log
 quiz --score mmlu.log
 ```
 
-### Sliding-window KV precision
+#### Sliding-window KV precision
 
 `IK2_KV=fp8-global` keeps the sliding layers' keys and values in FP16 and the global layers' cache in E4M3. At 393,216 reserved positions, the engine reported 6.31 GiB of KV in this mode and 6.16 GiB with E4M3 throughout. All 3,072 expert slots remained on the card in both runs.
 
@@ -874,12 +1132,12 @@ On the same 192 GSM8K questions the mixed cache answered **188/192** correctly. 
 Run the throughput command below. To repeat the quality comparison, use `radeon env IK2_KV=fp8-global ./build-ik2/tintero` for both engine invocations in the preceding GSM8K and MMLU commands.
 
 ```sh
-radeon env IK2_KV=fp8-global python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero \
+radeon env IK2_KV=fp8-global python3 tools/ik2_bench.py --engine ./build-ik2/tintero \
     --model /weight.gguf --ctx 393216 --chunk 1024 --tokens water.force \
     --depths 32,512,2048,8192,32768 --gen 129 --repeats 3
 ```
 
-### Agreement with the CPU reference
+#### Agreement with the CPU reference
 
 The engine and `ref/inkling2.py` read the same IQ4_NL weights and the [same 256 held-out token IDs](#held-out-distribution-fixture). We compared all 200,058 vocabulary entries at each position. The prefill used four 64-token chunks. A separate graph-decode run started at 224 input tokens and consumed the final 32 known tokens. The two sets of positions overlap.
 
@@ -898,16 +1156,16 @@ for kv in fp8 fp8-global f16; do
         --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
     radeon env IK2_KV="$kv" IK2_GRAPH=1 IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="$kv-tg.f32" \
         ./build-ik2/tintero --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
-    oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-pp.f32" --ref heldout-teacher-ref.npy \
+    oracle-env/bin/python tools/ik2_compare_decode.py "$kv-pp.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --prefill --prompt-length 256
-    oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-tg.f32" --ref heldout-teacher-ref.npy \
+    oracle-env/bin/python tools/ik2_compare_decode.py "$kv-tg.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
 done
-radeon env IK2_KV=f16 python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero \
+radeon env IK2_KV=f16 python3 tools/ik2_bench.py --engine ./build-ik2/tintero \
     --model /weight.gguf --chunk 1024 --tokens water.force --depths 512,8192 --gen 129 --repeats 3
 ```
 
-### Retrieval at 392,960 input tokens
+#### Retrieval at 392,960 input tokens
 
 The all-E4M3 preset returned the exact four-word phrase on all three direct-answer prompts. Each phrase had a different position in the archive, and every prefill started with zero cached tokens. A second request extended the same input by one token, reused all 392,960 previous tokens and timed 128 decode steps with stopping disabled.
 
@@ -920,7 +1178,7 @@ The all-E4M3 preset returned the exact four-word phrase on all three direct-answ
 ```sh
 for position in 5 50 95; do
     needle() {
-        python3 src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
+        python3 tests/ik2_retrieval.py --tokenizer ik2/tokenizer --data gsm8k-test.jsonl \
             --depths 392960 --percent "$position" --direct-answer --max-tokens 200 --decode-steps 128 "$@"
     }
     needle | radeon ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >"needle-$position.log"
@@ -928,9 +1186,9 @@ for position in 5 50 95; do
 done
 ```
 
-### Completed archive and drafter runs
+#### Completed archive and drafter runs
 
-With 392,576 background tokens the paged E4M3 server answered 23/32 MMLU questions correctly. All 32 answers were valid and all 32 requests reused the entire archive. The 256-token control scored 24/32. The first archive length of 392,704 left too little room for question 15. The CPU preflight now checks the complete tokenized question and its eight output tokens. Generate and score the requests with `tests/ik2_multiple_choice.py --max-context 393216 --prefix-tokens 392576 --background gsm8k-test.jsonl --data mmlu32.jsonl --tokenizer ik2-tokenizer/tokenizer`. Feed them to `radeon env IK2_PAGED_KV=1 ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024`. Add `--score SERVER.log --min-cached 392576` to the generator for scoring.
+With 392,576 background tokens the paged E4M3 server answered 23/32 MMLU questions correctly. All 32 answers were valid and all 32 requests reused the entire archive. The 256-token control scored 24/32. The first archive length of 392,704 left too little room for question 15. The CPU preflight now checks the complete tokenized question and its eight output tokens. Generate and score the requests with `tests/ik2_multiple_choice.py --max-context 393216 --prefix-tokens 392576 --background gsm8k-test.jsonl --data mmlu32.jsonl --tokenizer ik2/tokenizer`. Feed them to `radeon env IK2_PAGED_KV=1 ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024`. Add `--score SERVER.log --min-cached 392576` to the generator for scoring.
 
 The paged cache returned 986 on the three-record inventory after 392,192 tokens and the exact midpoint phrase after 392,960. It measured 45.12 tok/s on the 128-step midpoint replay. The accuracy checks support retaining the 393,216-position ceiling.
 
@@ -940,141 +1198,13 @@ The official Thinking Machines drafter at revision `b85c3cfa615fc413cc9af3379f49
 for drafter in plain adaptive; do
     args=()
     if test "$drafter" = adaptive; then args=(--draft mtp.safetensors); fi
-    radeon env IK2_DRAFT_CTX=8192 python3 src/tools/ik2_bench.py --engine ./gfx1100-9a0f164 --model /weight.gguf \
+    radeon env IK2_DRAFT_CTX=8192 python3 tools/ik2_bench.py --engine ./gfx1100-9a0f164 --model /weight.gguf \
         --ctx 32768 --chunk 1024 --gen 129 --repeats 3 --tokens water.force --depths 512,8192 "${args[@]}"
 done
 ```
 
-## Build on Prometheus without a GPU
 
-The source tree is under `~/ai/build/maya-ik2-hip/src`. The build container mounts its parent at `/work`. The following commands reproduce the environment from a synced source tree.
-
-```sh
-cd ~/ai/build/maya-ik2-hip
-docker run -d --name maya-ik2-hip-build --memory 6g --memory-swap 6g --cpus 4 \
-  -v "$PWD:/work" -w /work --entrypoint sleep ghcr.io/ggml-org/llama.cpp:server-rocm-b11176 infinity
-docker exec -it maya-ik2-hip-build bash
-```
-
-Run the following inside that container.
-
-```sh
-apt-get update -qq
-apt-get install -y --no-install-recommends build-essential cmake ninja-build git python3 python3-pip libomp-dev
-cmake -S src -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_HIP=ON -DSTRATA_BUILD_TESTS=ON \
-  -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm \
-  -DCMAKE_HIP_ARCHITECTURES=gfx1100
-cmake --build build-ik2 -j4 --target tintero ik2_kernels_test ik2_host_ref_test
-```
-
-The text engine links its own kernels and hipBLAS directly.
-
-## Serve the IQ4_NL model on gfx1100
-
-The Radeon preset runs a single text session with FP8 KV. From the repository root inside the ROCm environment, set the paths in the preset to the built executable and the installed GGUF, then export its tokenizer and start the HTTP server.
-
-```sh
-MODEL=models/Inkling-2-Mini-IQ4_NL.gguf
-python3 tools/strata_tokenizer.py --gguf "$MODEL" --out ik2 --chat-template tools/ik2/chat_template.jinja
-python3 serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini-gfx1100.json \
-    --host 127.0.0.1 --port 18085
-```
-
-On Prometheus the executable and installed weights were mounted at `/work/specialized` and `/weight.gguf`. The loopback HTTP check used a 32,768-token context and 1,024-token chunks. `GET /v1/models` returned `inkling-2-mini`. The ordinary chat request returned “Paris” and the streaming request returned “42”, a stop reason, and the final SSE `[DONE]`.
-
-```sh
-curl -fsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: application/json' \
-    -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"What is the capital of France? Reply in one word."}],"temperature":0,"reasoning_effort":"none","max_tokens":512}'
-curl -NsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: application/json' \
-    -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"What is 17 plus 25? Reply with digits only."}],"temperature":0,"reasoning_effort":"none","max_tokens":512,"stream":true}'
-```
-
-## Run the packaged image on Prometheus
-
-The image includes the gfx1100 engine, tokenizer, Python server and CPU and HIP image encoders. The default configuration reserves 393,216 positions for one FP8 conversation and uses medium reasoning effort. The HIP encoder keeps its original FP16 projector weights in host RAM. Mount the directory containing `Inkling-2-Mini-IQ4_NL.gguf` and `mmproj-F16.gguf`.
-
-Run from the Prometheus build directory to package the existing binaries. Buildx uses at most four CPUs and 6 GiB of RAM.
-
-```sh
-# Preserve the original resident HIP encoder, then rebuild mtmd with host weights.
-mkdir -p vision-resident
-cp -n vision-hip/bin/maya-vision vision-resident/maya-vision
-docker exec -w /work maya-ik2-hip-build cmake -S src/tools/vision -B vision-hip -DSTRATA_VISION_HOST_WEIGHTS=ON
-docker exec -w /work maya-ik2-hip-build cmake --build vision-hip --target maya-vision -j4
-sh src/docker/package-ik2-gfx1100.sh build-ik2/tintero ik2-tokenizer/tokenizer \
-    hyperion/maya-ik2:gfx1100-service-r4 vision-cpu/bin/maya-vision vision-resident/maya-vision vision-hip/bin/maya-vision
-docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 \
-    --entrypoint python3 hyperion/maya-ik2:gfx1100-service-r4 -m unittest serve.test_inkling2_frontend
-```
-
-The service uses Compose project `inkling-2-mini` and service key `llama` so the existing Prometheus controller can manage it. Install [the Compose file](../docker/compose.ik2-gfx1100.yml) as `~/ai/services/inkling-2-mini/docker-compose.yml` and run these commands from that directory. The model mount is read-only. The memory and swap limits are both 10 GiB.
-
-```sh
-docker compose config -q
-docker compose up -d --no-deps --pull never llama
-curl -fsS http://127.0.0.1:8085/health
-```
-
-Choose the cache in the Compose project's `.env`, then recreate the container. With the default FP8 preset, `IK2_CACHE_SLOTS=2` gives two 196,608-token conversations. Three or four slots divide the same 393,216 positions evenly. The packaged FP4 presets give each conversation more room. Set `MAYA_IK2_PRESET=ik2-mini-gfx1100-fp4-2.json` for two 360,448-token conversations or `MAYA_IK2_PRESET=ik2-mini-gfx1100-fp4-4.json` for four at 176,128 each. The filenames set the slot count too. Changing profiles discards the previous caches. [Measured capacities and profile selection](#named-fp4-profiles)
-
-The FP8 preset uses 1,024-token prefill chunks with one or two slots and 512 with three or four. Both FP4 presets use 512. To select CPU vision, set `MAYA_IK2_PRESET=ik2-mini-gfx1100.json`. Use `ik2-mini-gfx1100-text.json` for text only.
-
-## CUDA and HIP differences in the initial scalar port
-
-| Area | Phase 1 implementation |
-| --- | --- |
-| Wave size | The lane index, reductions, and broadcasts assume 32 lanes. The target is restricted to gfx1100. Strata's HIP intrinsics header supplies CUDA-compatible byte selection and warp operations. |
-| Decode and expert MMA | `mma.sync.m16n8k16`, packed-half PTX and Hopper `wgmma` use NVIDIA-specific register layouts. HIP omits those kernels and dispatches the existing scalar products. The CUDA switches keep their original behavior on NVIDIA. |
-| Prefill | The CUDA flash kernel uses `ldmatrix` and pipelined `cp.async`. Its dynamic shared-memory request is 88,064 bytes, above the 65,536-byte gfx1100 workgroup limit. HIP uses the existing tiled logits, softmax and strided batched GEMM path. With FP8 KV it unpacks cache chunks to FP16. This requires more scratch than CUDA flash. |
-| Cache and weights | gfx1100 has no native FP8 or FP4 math. KV uses the software E4M3FN conversion, including subnormals. NVFP4 uses E2M1 nibbles and unsigned block scales. Device compilation selects device-resident IQ lookup tables. |
-| Graphs | Global stream capture maps to HIP global capture. Instantiate and replay use the existing hipGraph wrappers. `IK2_GRAPH=0` runs individual launches for comparison. Replay and captured host/device copies need a card test. |
-| Memory | The compatibility header maps managed allocation, advice, prefetch and the CPU device ID to HIP. Managed KV remains opt-in and checks the device's concurrent managed access attribute. Ordinary resident decode uses device allocations. |
-| Speculative block verification | Block attention and its dense Q8 tile require CUDA MMA. HIP disables the block path. Serving rejects a drafter because the server verifies its proposals with that path. Explicit nonzero requests for `IK2_BLOCK`, `IK2_Q8_TILE`, `IK2_GROUP_MMA`, `IK2_EXPERT_MMA`, `IK2_ATTN_MMA`, `IK2_FLASH` or `IK2_WGMMA` fail at startup. |
-
-## Verification
-
-`/opt/rocm/llvm/bin/llvm-objdump --offloading build-ik2/maya-ik2` identified gfx1100 code objects in the linked executable. After extraction, `/opt/rocm/llvm/bin/llvm-readelf --notes build-ik2/maya-ik2.*gfx1100` reported a wavefront size of 32. `ldd build-ik2/maya-ik2` resolved the ROCm 7.2.1 HIP runtime and hipBLAS.
-
-Generate the synthetic input on a CPU with NumPy and PyTorch. The fixture uses PyTorch to decode the FP8 scales and calls `ref/inkling2.py`'s `Ref.moe` for the expected output. It requires no model files.
-
-```sh
-python3 tests/ik2_host_ref_fixture.py > /tmp/ik2-host-ref.bin
-scp /tmp/ik2-host-ref.bin sergio@192.168.100.111:ai/build/maya-ik2-hip/
-```
-
-Inside the build container, run `build-ik2/ik2_host_ref_test < /work/ik2-host-ref.bin`. On the Ryzen 5 3600 the host decoder matched every packed weight exactly. The C++ CPU expert's maximum absolute difference from the one-expert `Ref.moe` output was `1.90734863e-06`. This fixture covers one input through gate, up, SwiGLU and down. It does not exercise device execution or whole-model routing.
-
-`python3 -m unittest tools.test_hip_compat` passed the repository's CUDA name mapping checks. The CUDA 13 managed-memory shims are excluded from HIP. Both builds completed with the build container limited to four CPUs and 6 GiB of RAM with swap disabled. At completion, `df -h /work` reported 21G available on the root filesystem.
-
-To rerun the device suite, use `ctest --test-dir build-ik2 -R '^ik2_kernels_test$' --output-on-failure` with the GPU available. The suite contains scalar expert, routing, FP8 and FP16 attention checks against numerical references. The GPU validation below uses the installed ggml-org weights. Compare logits on identical forced tokens, generated text, and graph-on/off output before timing prefill and decode at different prompt depths.
-
-### Forced decode comparison
-
-Use identical prompt and forced token IDs in each run. The CLI writes its first raw logit row **after consuming the first forced token**. For `--gen N` it writes N−1 rows and omits the prompt prediction. The comparator checks the expected byte counts and reports top-1 agreement, mean/median/max KL, and the input position with the largest KL. It reads one vocabulary row at a time.
-
-Example for the GPU validation session, with `MODEL` pointing to the approved Mini GGUF, in a scratch directory. The token IDs below exercise the alignment only. For quality measurements use tokenized real text and the same cache format, prompt, and forced file in both runs.
-
-```sh
-printf '%s\n' '101,102,103' > force.csv
-for graph in 0 1; do
-  IK2_KV=fp8 IK2_GRAPH="$graph" IK2_FORCE=force.csv IK2_LOGITS_OUT="graph-$graph.f32" \
-    /work/build-ik2/tintero --model "$MODEL" --tokens 1,2 --gen 4 --ctx 256
-done
-python3 /work/src/tools/ik2_compare_decode.py graph-1.f32 --baseline graph-0.f32 \
-  --prompt-length 2 --gen 4 --vocab 200058
-```
-
-For comparison against the independent model reference, run the reference on a CPU machine with sufficient RAM for the GGUF forward pass. Pass the prompt followed by the first N−1 forced tokens. The example compares the same three decode rows as above. `--logprobs-out` saves the final array without retaining intermediate layer dumps.
-
-```sh
-python3 ref/inkling2.py "$MODEL" --tokens 1,2,101,102,103 --logprobs-out ref.npy
-python3 tools/ik2_compare_decode.py graph-1.f32 --ref ref.npy --prompt-length 2 --gen 4 --vocab 200058
-```
-
-Run throughput measurements separately with logit export disabled, since exporting the full vocabulary adds a device-to-host copy per step.
-
-## Prometheus GPU validation
+### Prometheus GPU validation
 
 The installed ggml-org IQ4_NL GGUF can be mounted read-only at `/weight.gguf`. It stores 24 physical layers under `inkling2_loop`. The three passes over layers 6–17 produce 48 visits. Each core layer stores its four message queries in q, k, v, FFN order. Twenty layers use IQ4_NL experts and four use Q8_0. Both the engine and CPU oracle read this layout directly.
 
@@ -1090,18 +1220,18 @@ for graph in 0 1; do
   IK2_GRAPH=$graph IK2_FORCE=paris-force.csv IK2_LOGITS_OUT=paris-$graph.f32 \
     build-ik2/tintero --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 4
 done
-oracle-env/bin/python src/ref/inkling2.py /weight.gguf --tokens 371,151451,149879,151194,149884,152717,11,149880 --logprobs-out paris-ref.npy
-oracle-env/bin/python src/tools/ik2_compare_decode.py paris-1.f32 --baseline paris-0.f32 --prompt-length 5 --gen 4 --vocab 200058
-oracle-env/bin/python src/tools/ik2_compare_decode.py paris-0.f32 --ref paris-ref.npy --prompt-length 5 --gen 4 --vocab 200058
+oracle-env/bin/python ref/inkling2.py /weight.gguf --tokens 371,151451,149879,151194,149884,152717,11,149880 --logprobs-out paris-ref.npy
+oracle-env/bin/python tools/ik2_compare_decode.py paris-1.f32 --baseline paris-0.f32 --prompt-length 5 --gen 4 --vocab 200058
+oracle-env/bin/python tools/ik2_compare_decode.py paris-0.f32 --ref paris-ref.npy --prompt-length 5 --gen 4 --vocab 200058
 ```
 
-### Expert decode baseline
+#### Expert decode baseline
 
-With the environment above and graph replay enabled, `build-ik2/maya-ik2 --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 65` measured 32.65 tok/s for 64 scalar decode steps. The prompt predicted the first generated token. On the same prompt, `IK2_GRAPH=0 rocprofv3 --kernel-trace --stats -f csv -d /work/profile-scalar -- /work/scalar-baseline --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 33` attributed 43.83% of the traced kernel time to single-token gate/up and 21.88% to down projections.
+With the environment above and graph replay enabled, `build-ik2/tintero --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 65` measured 32.65 tok/s for 64 scalar decode steps. The prompt predicted the first generated token. On the same prompt, `IK2_GRAPH=0 rocprofv3 --kernel-trace --stats -f csv -d /work/profile-scalar -- /work/scalar-baseline --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 33` attributed 43.83% of the traced kernel time to single-token gate/up and 21.88% to down projections.
 
-The vectorized IQ4_NL path reads four packed bytes per lane and uses gfx1100 byte-permute instructions to decode eight weights. Input activations and dot accumulators remain FP32. The GPU kernel suite passed. For a text check, tokenize “Water freezes at” and the continuation “ zero degrees Celsius and boils at one hundred degrees Celsius at sea level. At higher altitudes the boiling point falls because atmospheric pressure is lower.” with `tools/strata_tokenizer.py`. On this GGUF they yield 4 prompt and 30 continuation tokens. Force the continuation with `--gen 31`, export logits and run the oracle on all 34 tokens. `oracle-env/bin/python src/tools/ik2_compare_decode.py v1-water.f32 --ref water-ref.npy --prompt-length 4 --gen 31 --vocab 200058` measured 30/30 top-1, mean KL 0.0018280142 and max KL 0.0081613966.
+The vectorized IQ4_NL path reads four packed bytes per lane and uses gfx1100 byte-permute instructions to decode eight weights. Input activations and dot accumulators remain FP32. The GPU kernel suite passed. For a text check, tokenize “Water freezes at” and the continuation “ zero degrees Celsius and boils at one hundred degrees Celsius at sea level. At higher altitudes the boiling point falls because atmospheric pressure is lower.” with `tools/strata_tokenizer.py`. On this GGUF they yield 4 prompt and 30 continuation tokens. Force the continuation with `--gen 31`, export logits and run the oracle on all 34 tokens. `oracle-env/bin/python tools/ik2_compare_decode.py v1-water.f32 --ref water-ref.npy --prompt-length 4 --gen 31 --vocab 200058` measured 30/30 top-1, mean KL 0.0018280142 and max KL 0.0081613966.
 
-### RDNA3 expert and attention kernels
+#### RDNA3 expert and attention kernels
 
 `IK2_EXPERT_LIMB=60` uses signed integer dot products for IQ4_NL and Q8_0 experts during decode. Each group of sixteen activations shares a scale and uses two signed bytes per value. `IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1` groups routed tokens for native 16×16×16 FP16 matrix instructions with FP32 accumulation. `IK2_ATTN_MMA=1` enables WMMA decode attention on every visit, and `2` selects full-attention visits only. `IK2_FLASH=1` enables WMMA prefill attention. Both attention kernels accept FP16 and software-decoded E4M3 KV, including ring buffers, relative bias and the sink. At this stage HIP still rejected the CUDA block verifier. A later revision added native RDNA3 block attention.
 
@@ -1120,7 +1250,7 @@ cd /work
 echo '151712,156358,179692,149880,167442,82,149922,150011,156258,156358,179692,149922,151333,150628,13,150847,151197,178091,82,149876,167442,279,150279,159383,150301,186867,152023,149884,151214,13' > water.force
 IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1 \
 IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_EXPERT_LIMB=60 IK2_ATTN_MMA=0 IK2_FLASH=0 \
-python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 32,512,2048 --gen 129 --repeats 3 --chunk 128
 ```
 
@@ -1141,7 +1271,7 @@ The upstream Mini pull request describes the CUDA engine this fork ports, includ
 
 The inference optimization playbook studies larger MoE models whose experts spill into system RAM. Its advice on measuring prefix reuse applies to the two servers here. All experts of the installed Mini checkpoint fit in VRAM, which changes the value of its CPU and PCIe strategies. [Inference optimization playbook](https://github.com/alesha-pro/inference-optimization-playbook)
 
-### FP32 expert decode and packed E4M3 reads
+#### FP32 expert decode and packed E4M3 reads
 
 The IQ4_NL decode kernel reads eight GGUF blocks per wave and reuses each FP32 activation across gate and up rows. It also reads the FP16 down input directly from registers after conversion. The 32- and 128-row FP16 projections use four waves per output row. For attention, a pair of E4M3 bytes is expanded to FP16 in two lanes. Scaling the packed FP16 result by 256 preserves E4M3 subnormals. The WMMA prefill kernel stages Q and transposes V in LDS. The device suite checks the packed conversions, signed zero, small dense products, fused SwiGLU, down projections, and both attention formats against numerical references.
 
@@ -1160,16 +1290,16 @@ All throughput columns are in tokens per second. Run the following from `/work` 
 export IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1
 export IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_FLASH=1 IK2_Q8_TILE=1
 export IK2_EXPERT_LIMB=0 IK2_IQ4_MV=1 IK2_F16_MV=1 IK2_ATTN_MMA=0
-python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 32,512,2048,8192 --gen 129 --repeats 3 --chunk 128
 ```
 
-### Comparison with the production llama.cpp service
+#### Comparison with the production llama.cpp service
 
 The same `ik2_bench.py` replayed the same input IDs, request order and 129-token output length against the patched llama.cpp HTTP service. Both decoders ran alone on the 7900 XTX. The service retained its deployed 393,216-token context, Q4_0 K/V, batch 2,048 and microbatch 256. Maya reserved 8,321 positions for this run, used E4M3 K/V and a 128-token chunk. The benchmark rejects a cached prompt or incomplete output and divides the generation time by the 128 steps after prefill.
 
 ```sh
-python3 src/tools/ik2_bench.py --llama-url http://127.0.0.1:8085 --tokens water.force \
+python3 tools/ik2_bench.py --llama-url http://127.0.0.1:8085 --tokens water.force \
     --depths 32,512,2048,8192 --gen 129 --repeats 3
 ```
 
@@ -1182,18 +1312,18 @@ python3 src/tools/ik2_bench.py --llama-url http://127.0.0.1:8085 --tokens water.
 
 Medians in tok/s. The wider comparison is one GPU, one stream and one installed GGUF. Each runtime uses its own KV representation and greedy trajectories can diverge.
 
-### GSM8K
+#### GSM8K
 
 The first 96 GSM8K test questions use the official Inkling chat template with reasoning effort `none`, greedy sampling, and up to 1,024 generated tokens. The scorer reads the final content channel and compares its last number to the labeled answer. Missing final answers count as incorrect. With the FP32 expert configuration above, Maya scored **90/96** and the production llama.cpp service scored **93/96**. Both missed questions 12, 40 and 93 (zero-based). Maya reached the output limit before the final answer on questions 41, 86 and 87. The service reached the limit on 12 and 40. Both engines returned a final answer on the other 91 questions. This sample measures arithmetic and instruction following. [OpenAI GSM8K dataset](https://github.com/openai/grade-school-math/tree/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data)
 
 ```sh
 cd /work
 curl -fLsS https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/test.jsonl -o gsm8k-test.jsonl
-oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 >gsm96-requests.txt
+oracle-env/bin/python tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 >gsm96-requests.txt
 # Use the environment from the FP32 expert benchmark.
 ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 2048 --chunk 128 <gsm96-requests.txt >gsm96.log
-oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 --score gsm96.log
-oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 \
+oracle-env/bin/python tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 --score gsm96.log
+oracle-env/bin/python tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 \
     --llama-url http://192.168.100.111:8085
 ```
 
@@ -1202,16 +1332,16 @@ At a 4,096-token cap, the cooperative RDNA3 configuration answered **93/96** on 
 ```sh
 # Use the cooperative prefill environment below with IK2_EXPERT_TILE_LDS=1.
 for offset in 0 96; do
-    oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf \
+    oracle-env/bin/python tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf \
         --count 96 --offset "$offset" --max-tokens 4096 >"gsm-$offset.requests"
     ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 8192 --chunk 1024 \
         <"gsm-$offset.requests" >"gsm-$offset.log"
-    oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf \
+    oracle-env/bin/python tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf \
         --count 96 --offset "$offset" --score "gsm-$offset.log"
 done
 ```
 
-### Larger prefill chunks and exact router accumulation
+#### Larger prefill chunks and exact router accumulation
 
 On the installed IQ4_NL model, the 56 attention projection matrices occupy 1,228 MiB when dequantized to FP16. `IK2_PREFILL_DENSE=1` retains those matrices when VRAM has room after the expert cache and headroom. Decode continues to read the original planar Q8. The grouped expert kernel expands signed byte pairs and applies the original FP16 block scale. It can reuse one loaded weight tile across 16, 32 or 64 routed tokens. The table uses the 16-token tile.
 
@@ -1229,16 +1359,16 @@ The production comparison above used identical tokens at 8,192 and reached 1,488
 # Start with the FP32 expert environment above.
 export IK2_PREFILL_DENSE=1 IK2_PREFILL_TILE=16 IK2_Q8_MV=1 IK2_F16_MV=2
 for chunk in 512 1024; do
-    python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+    python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --depths 32,512,2048,8192,32768 --gen 129 --repeats 2 --chunk "$chunk"
 done
-python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 2048,8192,32768 --gen 129 --repeats 2 --chunk 2048
 ```
 
 `IK2_F16_MV=2` preserves the scalar router's FP32 FMA sequence within each lane and its wave reduction order. The gfx1100 device test compares its output bit for bit to this CPU computation. The library passage with E4M3 KV matched 12/13 CPU top-1 predictions (mean KL 0.02426905, maximum 0.22447712). With FP16 KV and uncompressed loop-gate weights it matched 9/13, with a lower mean KL of 0.00308744 and maximum 0.01372127. Both are full distributions over 200,058 tokens. Reproduce both with the library command above, `--chunk 128`, `IK2_ATTN_MMA=0 IK2_EXPERT_LIMB=0 IK2_IQ4_MV=1 IK2_Q8_MV=1 IK2_F16_MV=2 IK2_PREFILL_DENSE=1`. For the second run additionally set `IK2_KV=f16 IK2_GATE_BF16=0`.
 
-### Cooperative prefill and depth-dependent decode attention
+#### Cooperative prefill and depth-dependent decode attention
 
 A 64×64 WMMA projection tile replaced the hipBLAS FP16 products in large prefill batches. Four wave32 groups now share the K and transposed V for 64 query tokens. In decode, eight lanes cooperate on one key for sliding attention and short global attention. Global visits switch to WMMA at 8,192. The engine recaptures the graph when the split count or attention kernel changes. Expert matvecs specialize the 2,304- and 1,152-wide matrices of the installed model.
 
@@ -1250,7 +1380,7 @@ A 64×64 WMMA projection tile replaced the hipBLAS FP16 products in large prefil
 | 8,192 | 3,558.64 | 100.63 | 1,488.44 | 61.97 |
 | 32,768 | 3,010.93 | 87.67 | | |
 
-All five rows use the fixed asynchronous input transfer. A fast resident prefill could previously overwrite pinned embeddings or positions while their copy was pending. Reproduce the warm vs cold continuation check with `python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf --tokens water.force`.
+All five rows use the fixed asynchronous input transfer. A fast resident prefill could previously overwrite pinned embeddings or positions while their copy was pending. Reproduce the warm vs cold continuation check with `python3 tests/ik2_prefix_cache.py --engine ./build-ik2/tintero --model /weight.gguf --tokens water.force`.
 
 Medians in tok/s for three uncached requests per depth. Each request generates 129 tokens with 128 timed decode steps. Maya reserved 32,897 positions with FP8 KV. The service retained its deployed 393,216 positions with Q4_0 KV. On the first 32-token request the initial matrix-library setup took the prefill rate down to 18.52 tok/s. The other two measured 376.47 tok/s.
 
@@ -1260,15 +1390,15 @@ export IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_PREFILL_TILE=64 IK2_EXPERT_TIL
 export IK2_F16_MV=2 IK2_IQ4_MV=1 IK2_Q8_MV=1 IK2_Q8_TILE=1 IK2_EXPERT_LIMB=0
 export IK2_PREFILL_DENSE=1 IK2_DENSE_WMMA=1 IK2_FLASH=1 IK2_FLASH_WAVES=4
 export IK2_ATTN_MMA=3 IK2_DECODE_SUBWAVE=1 IK2_ATTN_STAGED=1 IK2_RESIDENT_ONLY=1
-python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf --tokens water.force \
+python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf --tokens water.force \
     --depths 32,512,2048,8192,32768 --gen 129 --repeats 3 --chunk 2048
 ```
 
 The gfx1100 device suite checks WMMA against FP64 on partial tiles and padded outputs. The attention tests cover E4M3 and FP16, sink and relative bias, ring wraparound, causal masking and multi-token block verification. Run `IK2_EXPERT_TILE_LDS=1 ./build-ik2/ik2_kernels_test` with the environment above. Two output rows sharing each Q8 input load slowed decode at every measured depth, so the engine keeps one row per wave.
 
-For long-context retrieval, `tests/ik2_retrieval.py` places a seeded four-word phrase among GSM8K distractor questions at an exact prompt depth. The score records the final content channel, the number of cached tokens and the stop reason. To reproduce the midpoint test, pass `--tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl --depths 32768,131072,392960`. Feed stdout to a resident server with `--ctx 393216 --chunk 1024`, then run the same Python command with `--score SERVER.log`.
+For long-context retrieval, `tests/ik2_retrieval.py` places a seeded four-word phrase among GSM8K distractor questions at an exact prompt depth. The score records the final content channel, the number of cached tokens and the stop reason. To reproduce the midpoint test, pass `--tokenizer ik2/tokenizer --data gsm8k-test.jsonl --depths 32768,131072,392960`. Feed stdout to a resident server with `--ctx 393216 --chunk 1024`, then run the same Python command with `--score SERVER.log`.
 
-### Copy and edit requests without a drafter
+#### Copy and edit requests without a drafter
 
 Maya can propose a continuation from the request's own tokens and check it against the target model. On Prometheus, a 64-token verification window copied an 81-box inventory at **271.15 tok/s** and made a single requested edit at **196.72 tok/s**. Plain decoding produced the same two final answers at 105.23 and 106.21 tok/s. Each figure is one uncached greedy request with a 3,072-token output limit. Timing excludes prefill and the first token. The edit took 1,586 generated tokens with verification and 1,601 without it, including the model's reasoning. These examples measure repeated text.
 
@@ -1281,11 +1411,11 @@ Maya can propose a continuation from the request's own tokens and check it again
 Use the preceding cooperative prefill environment with `IK2_EXPERT_TILE_LDS=1`. The GGUF and tokenizer are the same ones used for the throughput runs.
 
 ```sh
-oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer >copy.requests
+oracle-env/bin/python tests/ik2_copy_edit.py --tokenizer ik2/tokenizer >copy.requests
 for window in 0 8 64; do
     IK2_SUFFIX=$window ./build-ik2/tintero --serve-ik2 --model /weight.gguf \
         --ctx 4096 --chunk 512 <copy.requests >"copy-$window.log"
-    oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer --score "copy-$window.log"
+    oracle-env/bin/python tests/ik2_copy_edit.py --tokenizer ik2/tokenizer --score "copy-$window.log"
 done
 ```
 
@@ -1301,25 +1431,25 @@ The direct-answer HTTP template prefills the final content channel. With that sa
 # Use the preceding cooperative prefill environment with IK2_EXPERT_TILE_LDS=1.
 for task in inventory python; do
     for window in 0 64 128; do
-        oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+        oracle-env/bin/python tests/ik2_copy_edit.py --tokenizer ik2/tokenizer \
             --direct-answer --workload "$task" --repeats 3 >"copy-$task.requests"
         IK2_SUFFIX=$window ./build-ik2/tintero --serve-ik2 --model /weight.gguf \
             --ctx 8192 --chunk 512 <"copy-$task.requests" >"copy-$task-$window.log"
-        oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+        oracle-env/bin/python tests/ik2_copy_edit.py --tokenizer ik2/tokenizer \
             --direct-answer --workload "$task" --repeats 3 --score "copy-$task-$window.log"
     done
 done
 ```
 
-### Exact phrase retrieval at long context
+#### Exact phrase retrieval at long context
 
 In the run before the host input copy fix, with `--ctx 393216 --chunk 1024`, the resident IQ4_NL engine returned the exact four-word phrase at 32,768 and 131,072 tokens, placed halfway through each uncached prompt. At 392,960 input tokens the engine finished prefill in 470.020 seconds and used all 200 generation tokens without reaching its final answer. That request scored incorrect. All 3,072 experts remained on the card.
 
 ```sh
-oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
+oracle-env/bin/python tests/ik2_retrieval.py --tokenizer ik2/tokenizer --data gsm8k-test.jsonl \
     --depths 32768,131072,392960 >retrieval.requests
 ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 <retrieval.requests >retrieval.log
-oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
+oracle-env/bin/python tests/ik2_retrieval.py --tokenizer ik2/tokenizer --data gsm8k-test.jsonl \
     --depths 32768,131072,392960 --score retrieval.log
 ```
 
@@ -1333,7 +1463,7 @@ With the pinned-input fix, Maya again returned the exact midpoint phrase on the 
 These are single runs with token-major E4M3. The longer prompt fully recovered its 131,072-token prefix for the fixed-length request. To reproduce, add `--decode-steps 128` to both Python commands above and use `--depths 32768,131072`. Set `IK2_EXPERT_TILE_LDS=1` and `IK2_SHARED_COMBINE=1` with the cooperative prefill environment.
 
 
-### CUDA build check
+#### CUDA build check
 
 CUDA 12.8 compiled and linked the engine and its device tests for sm_86 with the following commands. The host used for compilation has no NVIDIA GPU.
 
@@ -1342,7 +1472,7 @@ cmake -S . -B build-cuda -G Ninja -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECT
 cmake --build build-cuda --target tintero ik2_kernels_test -j4
 ```
 
-### Held-out distribution fixture
+#### Held-out distribution fixture
 
 Use the first 256 tokenizer IDs from GSM8K test questions and solutions 192 through 199, numbered from zero. The first 224 IDs form the decode prompt and the remaining 32 are forced in order. The arithmetic evaluation above used questions 0 through 191.
 
@@ -1353,15 +1483,15 @@ from pathlib import Path
 from strata_tokenizer import Tokenizer
 rows = [json.loads(line) for line in Path("gsm8k-test.jsonl").read_text().splitlines()]
 text = "\n\n".join(r["question"] + "\n" + r["answer"] for r in rows[192:200])
-ids = Tokenizer.from_dir("ik2-tokenizer/tokenizer").encode(text)[:256]
+ids = Tokenizer.from_dir("ik2/tokenizer").encode(text)[:256]
 for name, seq in [("all", ids), ("prompt", ids[:224]), ("force", ids[224:])]:
     Path("heldout-teacher." + name).write_text(",".join(map(str, seq)))
 PYDATA
-OPENBLAS_NUM_THREADS=1 oracle-env/bin/python src/ref/inkling2.py /weight.gguf \
+OPENBLAS_NUM_THREADS=1 oracle-env/bin/python ref/inkling2.py /weight.gguf \
     --tokens "$(cat heldout-teacher.all)" --logprobs-out heldout-teacher-ref.npy
 ```
 
-### Global E4M3 pages
+#### Global E4M3 pages
 
 `IK2_PAGED_KV=1` groups 16 positions per KV head and transposes V inside each page. Sliding attention retains its ring. A 131,072-token midpoint retrieval with the direct page reader returned the exact same four-word phrase as the token-major layout. The 128-step decode measured 65.07 tok/s with pages and 59.76 with token-major KV. Cold prefill took 101.342 and 78.134 seconds respectively. These are single runs with `--ctx 393216 --chunk 1024` and `--decode-steps 128` in the retrieval command above.
 
@@ -1372,11 +1502,11 @@ export IK2_PAGED_KV=1
 ./build-ik2/ik2_kernels_test
 IK2_PREFILL_LOGITS_OUT=teacher-pages.f32 ./build-ik2/tintero --model /weight.gguf \
     --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
-oracle-env/bin/python src/tools/ik2_compare_decode.py teacher-pages.f32 --ref heldout-teacher-ref.npy \
+oracle-env/bin/python tools/ik2_compare_decode.py teacher-pages.f32 --ref heldout-teacher-ref.npy \
     --tokens heldout-teacher.all --vocab 200058 --prefill --prompt-length 256
 ```
 
-### Fused decode projections
+#### Fused decode projections
 
 The Radeon preset computes the FP16 attention sink and dynamic convolution taps alongside their Q8 projection. For short prompts this removes 16 launches per generated token. Across 32 forced steps the two paths produced byte-identical full-vocabulary logits. With the installed IQ4_NL GGUF, three 256-step greedy measurements gave the following medians in tok/s.
 
@@ -1389,7 +1519,7 @@ The Radeon preset computes the FP16 attention sink and dynamic convolution taps 
 ```sh
 # Export the cooperative prefill environment above.
 for flag in 0 1; do
-    IK2_DECODE_PROJ=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+    IK2_DECODE_PROJ=$flag python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --gen 257 --depths 32,512,8192 --repeats 3 --chunk 2048
     IK2_DECODE_PROJ=$flag IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="projection-$flag.f32" ./build-ik2/tintero --model /weight.gguf \
         --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
@@ -1398,7 +1528,7 @@ cmp projection-0.f32 projection-1.f32
 ```
 
 
-### Direct multiple-choice answers
+#### Direct multiple-choice answers
 
 On 256 questions from eight MMLU subjects, the paged E4M3 engine with the cancellation fix answered **207 correctly**. Every response supplied a valid letter. The first 32 test examples from each subject were selected before running either engine. Each chat requested one letter in the final content channel, with greedy decoding and an eight-token limit. The scorer accepts the letter with optional parentheses or a final period. [Pinned CAIS dataset](https://huggingface.co/datasets/cais/mmlu/tree/c30699e8356da336a370243923dbaf21066bb9fe)
 
@@ -1426,14 +1556,14 @@ PYDATA
 Use the cooperative prefill environment with fused projections and paged KV. Both engines receive the same token IDs.
 
 ```sh
-oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer >mmlu.requests
+oracle-env/bin/python tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2/tokenizer >mmlu.requests
 IK2_DECODE_PROJ=1 IK2_PAGED_KV=1 ./build-ik2/tintero --model /weight.gguf --serve-ik2 --ctx 4096 --chunk 512 \
     <mmlu.requests >mmlu-maya.log
-oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer --score mmlu-maya.log
-oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer --llama-url http://127.0.0.1:8085
+oracle-env/bin/python tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2/tokenizer --score mmlu-maya.log
+oracle-env/bin/python tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2/tokenizer --llama-url http://127.0.0.1:8085
 ```
 
-### Attention workgroups and KV layout
+#### Attention workgroups and KV layout
 
 The Radeon kernel splits the keys according to the number of query workgroups. Each wave covers 16 queries. Larger decode graphs use additional key splits at 32K, 128K and 256K positions. The paged decode kernel reads global KV directly, while prefill shares each page between waves. Four-wave measurements on the installed IQ4_NL model gave the following medians in tok/s. Each depth had three uncached requests and 128 timed decode steps.
 
@@ -1449,7 +1579,7 @@ The Radeon server preset uses token-major KV. The page layout takes the same byt
 # Use the cooperative prefill environment above.
 export IK2_DECODE_PROJ=1 IK2_FLASH_WAVES=4
 for page in 0 1; do
-    IK2_PAGED_KV=$page python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+    IK2_PAGED_KV=$page python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --depths 512,8192,32768 --gen 129 --repeats 3 --chunk 2048
 done
 for waves in 2 8; do
@@ -1457,7 +1587,7 @@ for waves in 2 8; do
 done
 ```
 
-### Looped-layer message gates
+#### Looped-layer message gates
 
 On a single decode token, 128 threads now read four input channels each for the two BF16 projections. One rank computes the input norms. The next kernel applies the two output projections to 64 channels per workgroup. The device test checks three simultaneous in-place gates against FP64 across all 6,912 outputs.
 
@@ -1466,27 +1596,27 @@ With `IK2_GATE_TILE=256`, median decode at 512 tokens rose from 113.93 to **117.
 ```sh
 # Use the cooperative prefill environment above with IK2_DECODE_PROJ=1.
 for tile in 64 256; do
-    IK2_GATE_TILE=$tile python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+    IK2_GATE_TILE=$tile python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
     IK2_GATE_TILE=$tile IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="gate-$tile.f32" \
         ./build-ik2/tintero --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
-    oracle-env/bin/python src/tools/ik2_compare_decode.py "gate-$tile.f32" --ref heldout-teacher-ref.npy \
+    oracle-env/bin/python tools/ik2_compare_decode.py "gate-$tile.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
 done
 IK2_GATE_TILE=256 ./build-ik2/ik2_kernels_test
 ```
 
-### Repeated requests against a shared prefix
+#### Repeated requests against a shared prefix
 
 The server has eight snapshots of the sliding KV and convolution state. Previously, changing the end of a request invalidated newer snapshots, but the next save could overwrite the shared prefix while empty slots were available. In a replay with a 256-token prefix the ninth branch recomputed all 256 tokens. The server now chooses an empty slot first. All 12 branches reused the full prefix and the last one produced the same four predictions as a cold replay.
 
 ```sh
 # Use the Radeon preset environment.
-python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero --model /weight.gguf \
+python3 tests/ik2_prefix_cache.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --branches 12
 ```
 
-### Host RAM on the production comparison server
+#### Host RAM on the production comparison server
 
 Prometheus gives the `inkling-2-mini` container 10 GiB of host RAM and the same combined RAM-plus-swap limit. The RX 7900 XTX has a separate 24 GB of VRAM. The service image defaults to a prompt cache of up to 8,192 MiB and 32 context checkpoints per slot. A checkpoint at 229,211 tokens occupied 48.670 MiB in the server log. Thirty-two checkpoints of that size would occupy 1.52 GiB. The crash did not retain an allocator-level breakdown.
 
@@ -1499,7 +1629,7 @@ docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{json .Con
 docker logs inkling-2-mini 2>&1 | grep 'erasing old context checkpoint' | tail -1
 ```
 
-### Fused expert activation in prefill
+#### Fused expert activation in prefill
 
 An 8,192-token natural prompt spent 809 ms of GPU work in IQ4_NL expert products and 44 ms in the separate SwiGLU kernel. With `IK2_PREFILL_SWIGLU=1`, a wave computes adjacent gate and up tiles and writes the scaled, capped FP16 activation. The device tests compare each stored half to the separate kernels and to an FP64 calculation for IQ4_NL and Q8_0. Across all 256 positions and 200,058 vocabulary entries of the held-out fixture, the fused and separate paths produced identical FP32 logits.
 
@@ -1517,14 +1647,14 @@ export IK2_WMMA_K=32
 for flag in 0 1; do
     IK2_PREFILL_SWIGLU=$flag IK2_PREFILL_LOGITS_OUT="swiglu-$flag.f32" ./build-ik2/tintero \
         --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
-    IK2_PREFILL_SWIGLU=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+    IK2_PREFILL_SWIGLU=$flag python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --depths 512,2048,8192,32768 --gen 129 --repeats 3 --chunk 2048
 done
 cmp swiglu-0.f32 swiglu-1.f32
 for k in 32 64; do IK2_WMMA_K=$k IK2_PREFILL_SWIGLU=1 ./build-ik2/ik2_kernels_test; done
 ```
 
-### Q8 attention output projection
+#### Q8 attention output projection
 
 The 3,072-input Q8 projection handles eight output rows per workgroup. It reads the original quantized weights and accumulates each row in the same order. A 37-row device test covers the partially filled last workgroup against FP64. For 32 held-out decode steps, the full-vocabulary FP32 logits matched the prior build byte for byte.
 
@@ -1533,7 +1663,7 @@ With the loop-gate optimization enabled, the median of three 256-step requests c
 ```sh
 # Run on the parent of the projection commit, then on the commit itself.
 export IK2_GATE_TILE=256 IK2_Q8_UNROLL=1 IK2_DECODE_PROJ=1
-python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
 IK2_Q8_UNROLL=1 ./build-ik2/ik2_kernels_test
 IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=projection.f32 ./build-ik2/tintero \
@@ -1541,7 +1671,7 @@ IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=projection.f32 ./build-ik2/tinter
 sha256sum projection.f32
 ```
 
-### Quality checks with background text
+#### Quality checks with background text
 
 The multiple-choice runner can place the same archive before each question. It sends one warm-up request and checks how much of the prefix each later request actually reused. With 256 archive tokens, the Radeon engine answered 24 of 32 questions correctly and returned a valid letter every time. Each question reused all 256 tokens. The sample contains indices 0 through 3 from each of the eight subjects in the 256-question fixture above.
 
@@ -1551,20 +1681,20 @@ A separate inventory task places three shipment records at 5%, 50% and 95% of th
 # Use the Radeon preset environment and the MMLU and GSM8K data above.
 python3 -c 'import json; print("".join(s for s in open("mmlu256.jsonl") if json.loads(s)["index"] < 4), end="")' >mmlu32.jsonl
 quiz() {
-    oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu32.jsonl \
-        --tokenizer ik2-tokenizer/tokenizer --prefix-tokens 256 --background gsm8k-test.jsonl "$@"
+    oracle-env/bin/python tests/ik2_multiple_choice.py --data mmlu32.jsonl \
+        --tokenizer ik2/tokenizer --prefix-tokens 256 --background gsm8k-test.jsonl "$@"
 }
 quiz | ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 4096 --chunk 512 >quiz.log
 quiz --min-cached 256 --score quiz.log
 ledger() {
-    oracle-env/bin/python src/tests/ik2_retrieval.py --data gsm8k-test.jsonl \
-        --tokenizer ik2-tokenizer/tokenizer --depths 32768 --inventory --direct-answer --max-tokens 32 "$@"
+    oracle-env/bin/python tests/ik2_retrieval.py --data gsm8k-test.jsonl \
+        --tokenizer ik2/tokenizer --depths 32768 --inventory --direct-answer --max-tokens 32 "$@"
 }
 ledger | IK2_PAGED_KV=1 ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >ledger.log
 ledger --score ledger.log
 ```
 
-### Larger copy and edit windows
+#### Larger copy and edit windows
 
 The HIP verifier can check up to 512 proposed inputs per target pass. With a window of at least 32 it computes up to 64 vocabulary rows together for greedy verification. The window is bounded by the prefill chunk size. Plain generation is the default.
 
@@ -1579,22 +1709,22 @@ These are medians of three direct-answer requests per cell. All 27 final answers
 ```sh
 # Use the preceding copy/edit commands with a 512-token chunk and windows 128, 256 and 512.
 for task in inventory python; do
-    oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+    oracle-env/bin/python tests/ik2_copy_edit.py --tokenizer ik2/tokenizer \
         --direct-answer --workload "$task" --repeats 3 >"$task.requests"
     for w in 128 256 512; do
         IK2_SUFFIX=$w ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 8192 \
             --chunk 512 <"$task.requests" >"$task-$w.log"
-        oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+        oracle-env/bin/python tests/ik2_copy_edit.py --tokenizer ik2/tokenizer \
             --direct-answer --workload "$task" --repeats 3 --score "$task-$w.log"
     done
 done
-oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+oracle-env/bin/python tests/ik2_copy_edit.py --tokenizer ik2/tokenizer \
     --direct-answer --inventory-lines 27 --max-tokens 2048 >long-copy.requests
-IK2_SUFFIX=512 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero --model /weight.gguf \
+IK2_SUFFIX=512 python3 tests/ik2_prefix_cache.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --chunk 512 --cancel-after 750 --cancel-request long-copy.requests
 ```
 
-### Precision of split E4M3 attention
+#### Precision of split E4M3 attention
 
 Two keys can have exactly equal dot products and opposite values. In a gfx1100 regression test, permuting the entries of one key changed its FP32 reduction order. The scalar and resident kernels returned −0.0000153 and −0.0000305 on a channel whose exact result is zero. The scalar E4M3 path now forms the score in FP64. The eight-lane resident kernel refines a score when its magnitude reaches 16, where FP32 spacing reaches 2⁻¹⁹. Both kernels returned zero on all 128 channels of the device regression. The separate 16,640-key stress case also passed at its original tolerance.
 
@@ -1605,13 +1735,13 @@ On 32 forced held-out steps, mean full-vocabulary KL was 0.002114 and top-1 agre
 ./build-ik2/ik2_kernels_test
 IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=attention.f32 ./build-ik2/tintero \
     --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
-oracle-env/bin/python src/tools/ik2_compare_decode.py attention.f32 --ref heldout-teacher-ref.npy \
+oracle-env/bin/python tools/ik2_compare_decode.py attention.f32 --ref heldout-teacher-ref.npy \
     --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
-IK2_WMMA_K=64 python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+IK2_WMMA_K=64 python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
 ```
 
-### Dense WMMA tile depth
+#### Dense WMMA tile depth
 
 The gfx1100 test suite exercises the 3,072-input by 2,304-output attention projection with 513 tokens. It checks the FP32 output against FP64 at the first and last channels and around tile boundaries. A 64-channel K tile accelerated this projection in isolation. Selecting it only for this shape gave mixed results on uncached natural prompts. The preset keeps the 32-channel depth.
 
@@ -1619,17 +1749,17 @@ The gfx1100 test suite exercises the 3,072-input by 2,304-output attention proje
 for k in 32 64; do IK2_WMMA_K=$k ./build-ik2/ik2_kernels_test; done
 ```
 
-### Short prompt tiles and inventory control
+#### Short prompt tiles and inventory control
 
 The Radeon preset chooses the MoE tile height from the number of routed rows per expert. On this model it uses 16 rows through 128 input tokens, 32 rows through 256, and 64 rows above that. The 64-row case uses fused SwiGLU. Median prefill time for 16, 32, 64 and 128 new tokens fell from 63, 88, 101 and 116 ms to 57, 80, 91 and 108 ms. At 256, 512, 1,024 and 2,048 tokens both settings measured 141, 180, 290 and 513 ms. At chunk sizes 64 and 256, all 256 held-out prefill rows matched the fixed-height run byte for byte across the full vocabulary.
 
 ```sh
 # Use the Radeon preset and the GSM8K test file and tokenizer from the retrieval check.
-oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
+oracle-env/bin/python tests/ik2_retrieval.py --tokenizer ik2/tokenizer --data gsm8k-test.jsonl \
     --depths 32768 >needle-32768.request
 python3 -c 'from pathlib import Path; ids=Path("needle-32768.request").read_text().splitlines()[0].split()[-1].split(","); Path("profile-pp-ids").write_text(",".join(ids[:8192]))'
 for rows in auto 64; do
-    IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero \
+    IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows python3 tools/ik2_bench.py --engine ./build-ik2/tintero \
         --model /weight.gguf --tokens profile-pp-ids --depths 16,32,64,128,256,512,1024,2048 --chunk 2048 --gen 3 --repeats 5
     for chunk in 64 256; do
         IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows IK2_PREFILL_LOGITS_OUT="tile-$chunk-$rows.f32" ./build-ik2/tintero \
@@ -1641,7 +1771,7 @@ for chunk in 64 256; do cmp "tile-$chunk-auto.f32" "tile-$chunk-64.f32"; done
 
 On the three-record inventory, the direct-answer prompt returned the correct 986 at 256 and 2,048 input tokens and 1,008 at 32,768. Allowing the model to reason before answering produced 986 at all three depths. The model used 355, 169 and 488 generated tokens respectively. Switching all KV entries to FP16 did not recover the 32,768-token direct answer. Run the ledger command above with `--depths 256,2048,32768`, then remove `--direct-answer` and use `--max-tokens 512` for the reasoning control.
 
-### NVFP4 expert WMMA on RDNA3
+#### NVFP4 expert WMMA on RDNA3
 
 The Radeon kernel unpacks GGUF NVFP4 in registers. Each 36-byte block holds 64 E2M1 weights and four unsigned E4M3 scales. Batched prefill can group resident experts and apply the same capped SwiGLU as the IQ4_NL path. For single-token NVFP4 decode, `IK2_EXPERT_MMA=1` enables a WMMA gate/up product with a two-half representation of the FP32 input and a down projection over the FP16 hidden state. The default for single-token NVFP4 on HIP remains scalar.
 
@@ -1654,7 +1784,7 @@ done
 IK2_EXPERT_MMA=1 IK2_WMMA_K=32 IK2_EXPERT_TILE_LDS=0 ./build-ik2/ik2_kernels_test
 ```
 
-### Resident prefill workspace and projection cache
+#### Resident prefill workspace and projection cache
 
 The grouped expert gate/up and down projections use one FP32 workspace in sequence. SwiGLU places its FP16 output in a separate buffer. With an 8,192-token chunk this saves 576 MiB of expert scratch, enough for the engine to keep all 56 dense attention projections in FP16 under the existing VRAM headroom setting. On 8,192 and 32,768 input tokens, median prefill fell from 2.175 and 9.756 seconds to 2.078 and 9.612 seconds respectively. At 512 tokens it went from 0.215 to 0.221 seconds. All 256 rows of held-out prefill logits matched the previous allocation byte for byte, both with a 64-token chunk and with a 256-token chunk.
 
@@ -1663,11 +1793,11 @@ The Radeon preset uses `IK2_PREFILL_DENSE=2` to keep just the 24 fused QKV proje
 ```sh
 # Use the preset environment and profile-pp-ids from the short-prompt test above.
 # Compare the workspace on commit 3b2e4ac and the compact build using the same 56-matrix cache.
-IK2_PREFILL_DENSE=1 python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+IK2_PREFILL_DENSE=1 python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens profile-pp-ids --depths 512,8192,32768 --chunk 8192 --gen 3 --repeats 3
 
 for cache in 1 0 2; do
-    IK2_PREFILL_DENSE=$cache python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
+    IK2_PREFILL_DENSE=$cache python3 tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens profile-pp-ids --depths 64,256,512,2048,8192,32768 --chunk 2048 --gen 3 --repeats 3
     IK2_PREFILL_DENSE=$cache IK2_PREFILL_LOGITS_OUT="cache-$cache.f32" ./build-ik2/tintero \
         --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.all --gen 0
@@ -1675,7 +1805,7 @@ done
 cmp cache-0.f32 cache-1.f32 && cmp cache-1.f32 cache-2.f32
 ```
 
-### Alternating prompt lengths
+#### Alternating prompt lengths
 
 The preset keeps the two most recently used decode graphs for each output mode. When successive requests cross an attention depth boundary, the engine can replay the previous graph. On 24 alternating uncached prompts of 128 and 2,048 tokens, both configurations returned the same 120 greedy token IDs. After the first two requests of each length, the median time for four decode steps fell from 38 to 34 ms at 128 tokens and from 40 to 36 ms at 2,048. The second graph used another 2 MiB of reported device memory at a context reservation of 393,216. A separate run visited depths 128, 2,048 and 8,192 in the order A, B, C, A, C, B, first greedy and then with temperature 0.7, top-p 0.95 and seed 1. All 60 generated token IDs matched with the cache enabled and disabled. Expert placement in managed or host memory retains its existing graph lifecycle.
 
@@ -1707,7 +1837,7 @@ for pair in (0, 1):
 PY
 ```
 
-### Single-token NVFP4 timings
+#### Single-token NVFP4 timings
 
 For single-token WMMA, the E2M1 lookup now constructs the four FP16 values directly from their high bytes. Sixteen waves split the gate/up dot products, and four split each down projection. At model width, all 1,152 activated gate/up outputs and 2,304 down outputs passed the FP64 check with the same tolerances as the smaller case. The device suite passed at both K depths and with register tiles.
 
@@ -1716,12 +1846,12 @@ With eight of 128 generated experts active and width 2,304, the median gate/up k
 ```sh
 # From /work in the CPU build container. For the earlier comparison, link the same tool against the previous library.
 hipcc --offload-arch=gfx1100 -O3 -DSTRATA_USE_HIP=1 -Isrc/include/strata/hip_compat -Isrc/src/ik2 \
-    src/tools/ik2_nv_bench.hip -x none build-ik2/libik2_kernels.a -o ik2-nv-bench
+    tools/ik2_nv_bench.hip -x none build-ik2/libik2_kernels.a -o ik2-nv-bench
 # In the GPU container.
 IK2_EXPERT_MMA=1 ./ik2-nv-bench
 ```
 
-### Other gfx1100 experiments
+#### Other gfx1100 experiments
 
 Prometheus kept four waves for global prefill. Using eight after 8,192 cached positions reduced the time of an isolated deep attention kernel but increased full-model prefill at both 32K and 64K. Double buffering the input and weight tiles in LDS also increased full-model prefill time at 2K, 8K and 32K. Fully unrolling the 2,304-input Q8 projections changed median decode by less than 0.5 tok/s at both 512 and 8K. The preset keeps the existing unroll.
 
@@ -1731,16 +1861,16 @@ These commands use the retained experiment binaries in the Prometheus build dire
 
 ```sh
 for waves in 4 auto; do
-    IK2_FLASH_WAVES=$waves IK2_PREFILL_DENSE=1 python3 src/tools/ik2_bench.py --engine ./flash-depth \
+    IK2_FLASH_WAVES=$waves IK2_PREFILL_DENSE=1 python3 tools/ik2_bench.py --engine ./flash-depth \
         --model /weight.gguf --tokens profile-pp-ids --depths 32768,65536 --gen 3 --ctx 393216 --repeats 3 --chunk 1024
 done
 for pipeline in 0 1; do
     IK2_PREFILL_PIPELINED=$pipeline IK2_WMMA_K=32 IK2_PREFILL_TILE=64 IK2_PREFILL_DENSE=1 \
-        python3 src/tools/ik2_bench.py --engine ./pipeline --model /weight.gguf --tokens profile-pp-ids \
+        python3 tools/ik2_bench.py --engine ./pipeline --model /weight.gguf --tokens profile-pp-ids \
         --depths 2048,8192,32768 --gen 3 --repeats 3 --chunk 2048
 done
 for unroll in 4 18; do
-    IK2_PROJ_UNROLL=$unroll python3 src/tools/ik2_bench.py --engine ./proj-width --model /weight.gguf \
+    IK2_PROJ_UNROLL=$unroll python3 tools/ik2_bench.py --engine ./proj-width --model /weight.gguf \
         --tokens water.force --depths 512,8192 --gen 257 --repeats 3 --chunk 2048
 done
 for order in 1 0; do
@@ -1750,6 +1880,6 @@ done
 cmp order-0.f32 order-1.f32
 ```
 
-### Global attention at 392,957 keys
+#### Global attention at 392,957 keys
 
 The device suite checks the global attention computation at the production context depth independently of a language task. Four keys at 5%, 50%, 95% and the last position carry known scores and value patterns. All other keys and the attention sink have score zero. This gives a closed-form FP64 reference for every output channel. The first query must exclude the last key, the second must include it, and unused positions in the final 16-token page carry large sentinel values. On gfx1100 both cache layouts passed all 768 prefill outputs and all 384 decode outputs at 512 decode splits. Run `./build-ik2/ik2_kernels_test` with the Radeon preset.
