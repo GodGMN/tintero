@@ -989,6 +989,8 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
+        if os.name == "nt" and not Path(exe).exists() and Path(exe + ".exe").exists():
+            exe = exe + ".exe"
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
         self.model_path = paths.get("--native") or paths.get("--pack") or paths.get("--model", "pack/full")

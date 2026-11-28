@@ -3,7 +3,7 @@
   <img src="assets/tintero-wordmark.png" alt="Tintero" width="300">
 </picture></h1>
 
-Tintero is a local Linux inference server for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) supporting **AMD (HIP)** and **NVIDIA (CUDA)** GPUs. It is tailored to keep the full quantized model resident on a single **24 GB+ VRAM** card, with FP8/FP4 KV context scaling to whatever memory you have available and optional zero-retraining runtime abliteration (`IK2_ABLATE_MODE=on`).
+Tintero is a local inference server for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) supporting **AMD (HIP)** and **NVIDIA (CUDA)** GPUs on Linux and native **Windows (MSVC + CUDA)**. On **24 GB+ VRAM** cards it keeps the full quantized model resident with FP8/FP4 KV context scaling; on **12 GB** cards it runs with profile-warmed VRAM expert caching and a 3-tier **VRAM -> pinned RAM -> parallel Direct-I/O disk** store. Optional zero-retraining runtime abliteration (`IK2_ABLATE_MODE=on`) is included.
 
 ### Tested hardware
 
@@ -12,6 +12,7 @@ Tintero is a local Linux inference server for [Inkling-2-Mini](https://huggingfa
 | RX 7900 XTX, gfx1100 | IQ4_NL, FP8, one stream, 4,096 input tokens, median of three | 3,459.46 prefill / 111.01 decode |
 | DGX Spark GB10, sm_121a | IQ4_NL quality preset, one stream, 512 input tokens | 45.04 median decode |
 | DGX Spark GB10, sm_121a | UD-Q4_K_XL + Q8 DFlash2 preset, eight active sampled coding streams | 121.07 and 128.71 whole-run aggregate |
+| RTX 4070 12 GB, sm_89 (Windows 10) | IQ4_NL, FP4-global, `IK2_GPU_SERVED=1` (profile-warmed, 16 GiB RAM) | 25.3–29.2 decode |
 | A100-SXM4-80GB, sm_80 (historical) | IQ4_NL, FP8, one stream | 98.8 decode / 2,155–2,184 prefill across 4K–32K inputs |
 
 See [preset measurements](docs/PRESETS.md#measurements) for context reservations, workload sizes, timing intervals and historical comparisons. The [source-build examples](docs/PRESETS.md#source-only-presets) cover DFlash2 on Spark and the experimental Strix Halo target.
@@ -91,7 +92,17 @@ cmake --build build --target tintero ik2_kernels_test -j4
 ./build/ik2_kernels_test
 ```
 
-Install Python dependencies, download the model, export the tokenizer, and start a preset from [docs/PRESETS.md](docs/PRESETS.md):
+Windows (MSVC + CUDA, tested with Visual Studio 2022 BuildTools and CUDA 13.1 on RTX 4070 12 GB — run each line in *Developer PowerShell for VS*):
+
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build --target tintero ik2_kernels_test ik2_host_store_test ik2_served_policy_test -j4
+ctest --test-dir build --output-on-failure
+```
+
+On Windows, create the Python virtual environment with `python -m venv .venv`, activate it with `.\.venv\Scripts\Activate.ps1`, install `docker/requirements.txt` and `huggingface_hub`, download the GGUF, export the tokenizer, and start a preset (for example `docs/inkling2-mini/cuda-12gb-tiered.json` on a 12 GB card).
+
+Install Python dependencies (Linux), download the model, export the tokenizer, and start a preset from [docs/PRESETS.md](docs/PRESETS.md):
 
 ```sh
 python3 -m venv .venv

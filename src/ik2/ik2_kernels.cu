@@ -3181,6 +3181,7 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
     const int stride = Q8 ? K / 32 * 34 : K / 64 * 36;
     const uint8_t* a = blobs[s] + (Gate ? 0 : offset) + (size_t)r * stride;
     const uint8_t* b = a + (Gate ? offset : 8 * stride);
+    __shared__ float4 partial[Splits][32];
     float v[4] = {};
     if constexpr (Q8) {
         for (int k = split; k < K / 32; k += Splits) {
@@ -3208,7 +3209,7 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
             v[2] += sb * block_sum[2];
             v[3] += sb * block_sum[3];
         }
-    } else
+    } else {
         for (int k = split; k < K / 64; k += Splits) {
             const uint8_t* ap = a + k * 36;
             const uint8_t* bp = b + k * 36;
@@ -3222,7 +3223,7 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
 #endif
             bw_fp16_block(v, ap, bp, (Gate ? input16 : h) + (size_t)input_row * K + k * 64);
         }
-    __shared__ float4 partial[Splits][32];
+    }
     partial[split][lane] = make_float4(v[0], v[1], v[2], v[3]);
     __syncthreads();
     if (split) return;

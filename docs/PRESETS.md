@@ -6,6 +6,7 @@ Choose a JSON file from `docs/inkling2-mini/`.
 | --- | --- | --- | --- | --- | ---: |
 | RX 7900 XTX (`gfx1100`) | Single conversation | `ik2-mini-gfx1100.json` | IQ4_NL | FP8 | 393,216 |
 | Strix Halo (`gfx1151`, experimental) | Long context on unified RAM | `strix-halo-gfx1151.json` | IQ4_NL | Paged FP4 | 524,288 |
+| RTX 4070 / 12 GB CUDA card | Single conversation (tiered VRAM / RAM / disk) | `cuda-12gb-tiered.json` | IQ4_NL | FP4 global | 32,768 |
 | RTX 3090, 4090 or 5090 with 24 GB+ | Long chat on one card | `cuda-24gb-fp4.json` | IQ4_NL | FP4 global | 262,144 |
 | A100 or H100 with 80 GB | Long chat with FP8 KV | `cuda-80gb.json` | IQ4_NL | FP8 | 393,216 |
 | DGX Spark GB10, 121 GiB | Single user | `dgx-spark-quality.json` | IQ4_NL | FP8 | 262,144 |
@@ -46,6 +47,20 @@ The RX 7900 XTX ran stock IQ4_NL on ROCm 7.2.1 with all experts resident, one gr
 | FP4 | 3.46 GiB | 4,096 | 3,480.03 | 107.47 |
 
 The historical A100-SXM4-80GB run used CUDA 13.0, stock IQ4_NL, one stream and 393,216 FP8 positions. It reported 98.8 decode tok/s and 2,155–2,184 prefill tok/s across 4K–32K inputs. The report gives no per-depth mapping. [Original A100 measurement](https://github.com/GodGMN/tintero/commit/99c2668e)
+
+### RTX 4070 12 GB (Windows 10, CUDA 13.1)
+
+Measured on a desktop Windows 10 machine with an RTX 4070 12 GB (`sm_89`, ~10.8 GiB free VRAM with desktop apps open), 32 GB system RAM (~16.6 GiB available), and the 17.6 GB `IQ4_NL` GGUF stored on a 7200 RPM SATA HDD (`~100–150 MB/s`). All runs used `IK2_KV=fp4-global`, `--max-context 32768`, `--chunk 1024`, a 97-token coding prompt (plus an 80-token history prompt for the topic-shift check), and greedy decoding for 64 tokens (63 timed decode steps). Every mode produced bit-identical 64/64 greedy token IDs.
+
+| Mode | VRAM / RAM expert budget | Prefill (tok/s) | Decode (tok/s) | Decode tier breakdown |
+| --- | --- | ---: | ---: | --- |
+| `IK2_GPU_SERVED=1` (profile-warmed) | 45 hot/layer + reserves / 14.7 GiB pinned (`--ram-gb 16`) | 28.5–33.5 | 25.32–29.22 | 85.2% VRAM hits, 14.8% mapped RAM |
+| 3-tier auto-sized (cold) | 6.5 GiB VRAM (1,356 slots) / 11.8 GiB RAM (2,472 slots) | 4.0 | 2.62 | 88.4% VRAM, 10.0% RAM, 1.6% disk (HDD) |
+| 3-tier auto-sized (warmed + surplus RAM backing) | 6.5 GiB VRAM + 11.7 GiB RAM (disjoint + surplus backups) | 62.3 | 3.94 | 89.6% VRAM, 9.4% RAM, 1.0% disk (HDD) |
+| 3-tier constrained RAM (`--ram-gb 4`, warmed) | 6.5 GiB VRAM / 4.0 GiB RAM (835 slots) + Direct-I/O disk | 1.8 | 0.56 | 89.6% VRAM, 2.4% RAM, 8.1% disk (HDD) |
+| 3-tier topic shift (`--ram-gb 6`, coding profile -> history prompt) | 6.5 GiB VRAM / 6.0 GiB RAM (1,253 slots) + Direct-I/O disk | 1.9 | 0.81 | 89.4% VRAM, 5.1% RAM, 5.5% disk (HDD) |
+
+Because disk reads on that test system came from a spinning HDD, disk misses dominated wall time whenever host RAM was capped below the 14.7 GiB expert footprint. Storing the GGUF on an NVMe SSD removes that disk-tier bottleneck, and when ~15+ GiB of host RAM is available `IK2_GPU_SERVED=1` keeps all cold experts in pinned RAM and reaches 25–29 tok/s decode on the 12 GB card. Live HTTP serving via `serve/server.py` with `cuda-12gb-tiered.json` was also verified end-to-end on Windows 10.
 
 ## Run a preset
 
@@ -96,6 +111,17 @@ hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-Q4_K_XL.gguf --local-d
 hf download incoai/Inkling-2-Mini-DFlash2 model.safetensors --local-dir models/dflash2
 python3 tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-UD-Q4_K_XL.gguf --out ik2 --chat-template tools/ik2/chat_template.jinja
 python3 serve/server.py --engine maya --config docs/inkling2-mini/dgx-spark-dflash2.json --host 127.0.0.1 --port 8085
+```
+
+### 12 GB CUDA cards (Linux or Windows)
+
+`docs/inkling2-mini/cuda-12gb-tiered.json` enables `IK2_KV=fp4-global` and `IK2_GPU_SERVED=1` with a 32,768-token context. On hosts with enough free RAM for the 14.7 GiB expert footprint (e.g. 32 GB RAM), cold experts stay pinned in host memory and hot VRAM slots warm from the saved expert profile. On tighter-RAM hosts (or when `--ram-gb N` / `IK2_RAM_GB=N` is set), the engine automatically falls back to the 3-tier VRAM / pinned RAM / Direct-I/O disk store.
+
+```powershell
+# Windows (Developer PowerShell for VS)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build --target tintero -j4
+python serve\server.py --engine maya --config docs\inkling2-mini\cuda-12gb-tiered.json --host 127.0.0.1 --port 8085
 ```
 
 ### Strix Halo (experimental)

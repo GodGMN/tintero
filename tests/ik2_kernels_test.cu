@@ -2694,8 +2694,8 @@ void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, boo
     constexpr int KD = KV * D, HD = H * D, ld = 2 * HD + H * dr, slots = 3;
     const int used = depth + rows_per_slot + 8;
     const int T = 2 * rows_per_slot, cap = ring ? 80 : paged ? (used + 15) / 16 * 16 : used, splits = depth < 1024 ? 16 : 32;
-    const size_t stride = ring && !fp4_ring ? (size_t)cap * KD : (size_t)cap * KD / 32 * sizeof(k::Fp4KvBlock);
     const auto layout = test_fp8_layout(fp4_ring ? 5 : ring ? 1 : paged ? 4 : 3, ring ? cap : 0);
+    const size_t stride = layout.fp4 ? (size_t)cap * KD / 32 * sizeof(k::Fp4KvBlock) : (size_t)cap * KD;
     std::vector<int> slot_ids, positions;
     for (int t = 0; t < T; ++t) {
         slot_ids.push_back(t < rows_per_slot ? 2 : 0);
@@ -2705,7 +2705,7 @@ void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, boo
     auto* dp = dev(positions);
     std::vector<float> decoded((size_t)slots * cap * KD);
     std::vector<uint8_t> packed_k, packed_v;
-    if (ring && !fp4_ring) {
+    if (!layout.fp4) {
         packed_k.assign(slots * stride, 0x30);
         packed_v.assign(slots * stride, 0x38);
     } else {
@@ -2764,11 +2764,11 @@ void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, boo
     if (rows_per_slot > 1) {
         // Resume after different accepted prefixes and overwrite rejected KV with new rows.
         auto replacement = fvec(T * KD, 3);
-        CU(cudaMemcpy(values, replacement.data(), replacement.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CU(cudaMemcpyAsync(values, replacement.data(), replacement.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
         for (int t = 0; t < T; ++t) positions[t] += slot_ids[t] == 2 ? 1 : rows_per_slot - 1;
-        CU(cudaMemcpy(dp, positions.data(), T * sizeof(int), cudaMemcpyHostToDevice));
-        CU(cudaMemcpy(old_q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
-        CU(cudaMemcpy(q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CU(cudaMemcpyAsync(dp, positions.data(), T * sizeof(int), cudaMemcpyHostToDevice, stream));
+        CU(cudaMemcpyAsync(old_q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+        CU(cudaMemcpyAsync(q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
         per_row();
         batched();
         CU(cudaStreamSynchronize(stream));
@@ -2776,8 +2776,9 @@ void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, boo
     }
     if (time_graphs) {
         for (int pass = 0; pass < 2; ++pass) {
-            CU(cudaMemcpy(old_q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
-            CU(cudaMemcpy(q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
+            CU(cudaMemcpyAsync(old_q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+            CU(cudaMemcpyAsync(q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+            CU(cudaStreamSynchronize(stream));
             float old_us, new_us;
             if (pass == 0) old_us = time_attention_graph(per_row, stream);
             new_us = time_attention_graph(batched, stream);

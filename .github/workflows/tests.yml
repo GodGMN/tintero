@@ -34,3 +34,21 @@ jobs:
         run: |
           "$RUNNER_TEMP/venv/bin/python" tests/ik2_compare_decode_test.py
           node --test tools/test_*.mjs
+
+  windows-msvc:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure without a GPU SDK and run Windows MSVC host tests
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S . -B build-check -G Ninja -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF || exit /b 1
+          cl /nologo /std:c++20 /EHsc /O2 /W3 /Isrc\ik2 tests\ik2_served_policy_test.cpp /Fe:ik2_served_policy_test.exe || exit /b 1
+          ik2_served_policy_test.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /O2 /W3 /Isrc\ik2 tests\ik2_host_store_test.cpp /Fe:ik2_host_store_test.exe || exit /b 1
+          ik2_host_store_test.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /O2 /W3 /openmp /arch:AVX2 /fp:precise /Isrc\ik2 /c src\ik2\ik2_cpu_deep.cpp || exit /b 1
+          cl /nologo /std:c++20 /EHsc /O2 /W3 /Isrc\ik2 /c src\ik2\ik2_cpu.cpp || exit /b 1
