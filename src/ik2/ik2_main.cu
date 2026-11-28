@@ -6231,6 +6231,15 @@ int main(int argc, char** argv) {
             if (const auto* e = S.get("tokenizer.ggml.eos_token_id")) eos_ids.push_back((int) e->u);
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
+        std::vector<uint8_t> embd_owned;
+        if (g_fast && host_mmap && !g_managed_experts) {
+            const size_t embd_bytes = (size_t) c.n_vocab * (c.C / k::block_values(M.embd_type)) * k::block_bytes(M.embd_type);
+            embd_owned.assign(M.embd, M.embd + embd_bytes);
+            M.embd = embd_owned.data();
+            for (auto& Ly : M.L) Ly.host[0] = Ly.host[1] = Ly.host[2] = nullptr;
+            S.by_name.clear();
+            S.files.clear();
+        }
         if (batch_width > 1) {
             serve_sequences(M, batch_width, ctx, chunk, image_token, eos_ids, drafter, draft_head);
             pop_dump();
