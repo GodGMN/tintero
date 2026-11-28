@@ -17,11 +17,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # a venv, as installs run: maya.py started from a system Python hands itself to ./maya.sh (os.execve)
       - name: Python packages
         run: |
           python -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet gguf numpy pillow requests jinja2 regex pyyaml tqdm psutil 'jsonschema>=4.18,<5'
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet -r docker/requirements.txt
       - name: The AMD build's CUDA names all mapped (include/strata/hip_compat)
         run: '"$RUNNER_TEMP/venv/bin/python" tools/check_hip_compat.py'
       - name: Configure without a GPU SDK
@@ -29,8 +28,15 @@ jobs:
       - name: Server tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Tools tests
-        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
-      - name: Decode comparison and web client tests
         run: |
-          "$RUNNER_TEMP/venv/bin/python" tests/ik2_compare_decode_test.py
-          node --test tools/test_*.mjs
+          "$RUNNER_TEMP/venv/bin/python" -m unittest \
+            tools.test_ablate_fit tools.test_hip_compat tools.test_ik2_ablate_packaging \
+            tools.test_maya_names tools.test_strata_tokenizer tools.test_tintero_settings \
+            tools.test_tokenizer_glm tools.test_tokenizer_inkling
+      - name: Docker startup and Compose profiles
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" tests/docker_startup_test.py
+          docker compose --profile cuda config --quiet
+          docker compose --profile hip config --quiet
+      - name: Decode comparison
+        run: '"$RUNNER_TEMP/venv/bin/python" tests/ik2_compare_decode_test.py'

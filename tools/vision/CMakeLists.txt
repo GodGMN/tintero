@@ -1,5 +1,4 @@
-# tools/vision - maya-vision, the image encoder for Strata's multimodal path (optional; setup.py builds it when
-# the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
+# maya-vision is the optional image encoder for Tintero. It uses llama.cpp's mtmd library.
 #
 #   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
 #         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native]

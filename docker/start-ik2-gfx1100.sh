@@ -34,4 +34,5 @@ case "${IK2_ABLATE_MODE:-off}" in
         ;;
 esac
 
-exec python3 serve/server.py --engine maya --config "${MAYA_IK2_PRESET:-$preset}" "$@"
+preset_override=${TINTERO_IK2_PRESET-${MAYA_IK2_PRESET-}}
+exec python3 serve/server.py --engine maya --config "${preset_override:-$preset}" "$@"

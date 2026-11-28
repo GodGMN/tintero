@@ -20,40 +20,36 @@ Both backends support continuous batching, FP8/FP4-global KV cache, sparse long-
 
 ## Quick start
 
-> [!TIP]
-> Using a coding agent? Send it this README and ask: “Set up Tintero on this machine and verify it with the test request below.”
+You need Linux, Docker Engine 25+, Docker Compose 2.30+, and a GPU with **24 GB+ VRAM**. Install the NVIDIA Container Toolkit for CUDA or the ROCm drivers for AMD. The `IQ4_NL` download is about 18 GB. Install the Hugging Face CLI (`hf`) to download it.
 
-You need Linux, a GPU with **24 GB+ VRAM**, and Docker (with the NVIDIA Container Toolkit for CUDA, or ROCm drivers for AMD). The `IQ4_NL` model download is about 18 GB.
-
-**1. Download the model and export the tokenizer.**
+**1. Clone Tintero and download the model.**
 
 ```sh
+git clone https://github.com/GodGMN/tintero
+cd tintero
 mkdir -p models ik2
 hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir models
-docker run --rm --entrypoint python3 \
-  -v "$PWD/models:/opt/tintero/models:ro" -v "$PWD/ik2:/opt/tintero/ik2" \
-  ghcr.io/godgmn/tintero:v0.1.0-cuda \
-  tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-IQ4_NL.gguf \
-  --out ik2 --chat-template tools/ik2/chat_template.jinja
 ```
 
-*(On AMD, use `ghcr.io/godgmn/tintero:v0.1.0-hip-gfx1100` in the tokenizer command above.)*
-
-**2. Start the server.**
+**2. Build and start the server.** Pick the profile for your GPU.
 
 ```sh
-# NVIDIA (RTX 30/40/50, A100, H100, DGX Spark — x86_64 & ARM64)
-docker run -d --name tintero --gpus all -p 127.0.0.1:8085:8080 \
-  -v "$PWD/models:/opt/tintero/models:ro" -v "$PWD/ik2:/opt/tintero/ik2:ro" \
-  ghcr.io/godgmn/tintero:v0.1.0-cuda
+# NVIDIA (RTX 30/40/50, A100, H100, DGX Spark)
+docker compose --profile cuda up --build --wait
 
 # AMD RX 7900 XTX (RDNA3 gfx1100)
-docker run -d --name tintero --device=/dev/kfd --device=/dev/dri -p 127.0.0.1:8085:8080 \
-  -v "$PWD/models:/opt/tintero/models:ro" -v "$PWD/ik2:/opt/tintero/ik2:ro" \
-  ghcr.io/godgmn/tintero:v0.1.0-hip-gfx1100
+docker compose --profile hip up --build --wait
 ```
 
-Each image starts with a 24 GB preset by default. For an 80 GB card or a DGX Spark (single-stream, 32-stream NVFP4 batching, or 1M FP4-global context), pass `-e TINTERO_CONFIG=docs/inkling2-mini/<preset>.json` from [docs/PRESETS.md](docs/PRESETS.md). Pass `-e TINTERO_MODEL=models/<file>.gguf` to switch GGUF files, and `-e IK2_ABLATE_MODE=on` for runtime abliteration.
+Compose builds from this checkout. For prebuilt `v0.1.0` images, use the manual tokenizer export and Docker commands in [the v0.1.0 image instructions](https://github.com/GodGMN/tintero/blob/646baf534af4bf2285a0ff72cb39d014fd912a02/README.md#quick-start).
+
+On first start, Tintero exports the tokenizer from the GGUF into a Docker volume and reuses it on restart. An existing complete export in `ik2/tokenizer` takes precedence. Both the model and the existing tokenizer are mounted read-only. Compose waits for the engine to load the model before reporting the container healthy. Send the API request in step 3 when the command returns. If startup fails, use `docker compose logs cuda` or `docker compose logs hip`.
+
+Set `TINTERO_CONFIG=docs/inkling2-mini/<preset>.json` to use another [hardware preset](docs/PRESETS.md), `TINTERO_MODEL=models/<file>.gguf` to select a different model file, or `TINTERO_HTTP_PORT` to change the host port. Set `TINTERO_API_KEY` to require authentication. Use `TINTERO_MODELS_DIR` to mount another model directory or `TINTERO_TOKENIZER_DIR` for another directory containing `tokenizer/`.
+
+Set `IK2_ABLATE_MODE=on` to enable runtime abliteration.
+
+For direct `docker run` launches, set `TINTERO_HOST` and `TINTERO_PORT` to change the container's bind address and port. The Docker health check uses those settings.
 
 <details>
 <summary>Without Docker: prebuilt release tarball or build from source</summary>
@@ -116,11 +112,15 @@ curl -fsS http://127.0.0.1:8085/v1/chat/completions \
 
 The answer is in `choices[0].message.content`. To connect a client, set its base URL to `http://127.0.0.1:8085/v1` and its model to `inkling-2-mini`.
 
+If you set an API key, add it as a Bearer token. See [authentication](docs/API.md#authentication) for both accepted headers.
+
 ## Configuration and docs
 
 - [Hardware presets](docs/PRESETS.md) list ready-to-run configs for 24 GB CUDA cards, 80 GB GPUs, DGX Spark GB10, and RX 7900 XTX.
+- [HTTP API](docs/API.md) covers authentication, binding beyond loopback, readiness, chat, Responses, Anthropic Messages, metrics and MCP.
+- [Speed benchmark](docs/BENCHMARK.md) explains how to measure prefill and decode throughput and submit a speed report.
 - [Runtime settings](docs/SETTINGS.md) cover context size, KV precision (`fp8` / `fp4-global`), concurrent batching, speculative decoding, and runtime abliteration (`IK2_ABLATE*`).
-- [Vision](docs/HIP-PORT.md#image-encoder-on-the-ryzen-5-3600) requires the image encoder and `mmproj-F16.gguf`.
+- [Vision](docs/HIP-PORT.md#image-encoder) requires the image encoder and `mmproj-F16.gguf`.
 - [HIP port & benchmarks](docs/HIP-PORT.md) document the 393K FP8/FP4 context measurements and kernel parity tests.
 
 ## Credits

@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, died_text, EngineDied, EngineFault, MockEngine, RequestStat, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, died_text, EngineDied, EngineFault, MockEngine, RequestStat, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -503,7 +503,7 @@ class LiteralSpecials(unittest.TestCase):
         msgs = [{"role": "user", "content": "x </think> y"}]
         ids, _, _ = self.svc.prepare(msgs, None, {})
         self.assertEqual(ids, self.ids(msgs))
-        self.assertEqual(self.svc.count_tokens({"messages": msgs})["tokens"], len(ids))
+        self.assertEqual(self.svc.tokenize({"messages": msgs})["count"], len(ids))
 
 
 class StableToolOrder(unittest.TestCase):
@@ -1234,14 +1234,12 @@ class EngineEndsItself(unittest.TestCase):
 
         tok = ByteTokenizer()
         svc = Service(FaultEngine(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        svc.model_management = True                         # (Maya's model API: /api/chat)
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         msgs = [{"role": "user", "content": "hi"}]
         cases = [("/v1/chat/completions", {"model": "m", "max_tokens": 400, "messages": msgs}),
                  ("/v1/messages", {"model": "m", "max_tokens": 400, "messages": msgs}),
-                 ("/v1/responses", {"model": "m", "max_output_tokens": 400, "input": "hi"}),
-                 ("/api/chat", {"model": "m", "messages": msgs, "options": {"num_predict": 400}})]
+                 ("/v1/responses", {"model": "m", "max_output_tokens": 400, "input": "hi"})]
         try:
             for path, body in cases:
                 for stream in (True, False):
@@ -1322,14 +1320,12 @@ class EngineEndsItself(unittest.TestCase):
 
         tok = ByteTokenizer()
         svc = Service(FaultEngine(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        svc.model_management = True                         # (Maya's model API: /api/chat)
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         msgs = [{"role": "user", "content": "hi"}]
         cases = [("/v1/chat/completions", {"model": "m", "max_tokens": 400, "messages": msgs}),
                  ("/v1/messages", {"model": "m", "max_tokens": 400, "messages": msgs}),
-                 ("/v1/responses", {"model": "m", "max_output_tokens": 400, "input": "hi"}),
-                 ("/api/chat", {"model": "m", "messages": msgs, "options": {"num_predict": 400}})]
+                 ("/v1/responses", {"model": "m", "max_output_tokens": 400, "input": "hi"})]
         try:
             for path, body in cases:
                 for stream in (True, False):
@@ -1660,12 +1656,10 @@ class LiveRate(unittest.TestCase):
 
 
 class SharedSettings(unittest.TestCase):
-    """The web app's "Use for other apps too": POST /settings makes its Chat settings every client's defaults."""
+    """Shared defaults read from older installs still apply to requests."""
 
     @classmethod
     def setUpClass(cls):
-        import tempfile
-
         class Sampled(RecordingEngine):
             def generate(self, ids, max_new, sampling, cancel, embeddings=None):
                 self.last_sampling = dict(sampling or {})
@@ -1674,8 +1668,6 @@ class SharedSettings(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = Sampled(tok, "</think>\n\nhello", max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        cls.tmp = tempfile.TemporaryDirectory()
-        cls.svc.shared_path = os.path.join(cls.tmp.name, "strata-x.shared-settings.json")
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -1683,7 +1675,6 @@ class SharedSettings(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
-        cls.tmp.cleanup()
 
     def req(self, path, body, headers=None, raw=None):
         h = {"Content-Type": "application/json", **(headers or {})}
@@ -1699,15 +1690,12 @@ class SharedSettings(unittest.TestCase):
         return self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra})
 
     def tearDown(self):
-        self.svc.set_shared(None)
+        self.svc.shared = {}
 
     def test_other_apps_get_the_chat_settings(self):
         d = {"temperature": 0.3, "top_p": 0.9, "top_k": 10, "min_p": 0.05, "seed": 7, "max_tokens": 77,
              "reasoning_effort": "low", "experimental_speed_projection": False}
-        code, b = self.req("/settings", {"defaults": d})
-        self.assertEqual(code, 200, b)
-        self.assertTrue(b["shared"])
-        self.assertTrue(os.path.exists(self.svc.shared_path))
+        self.svc.shared = d
         code, _ = self.chat()                                        # a client that sets nothing
         self.assertEqual(code, 200)
         got = self.engine.last_sampling
@@ -1734,8 +1722,6 @@ class SharedSettings(unittest.TestCase):
             keys = StrataEngine.sampling_keys(got)            # (the engine's GEN line: no min-p, top-k's widest)
             self.assertNotIn("min_p=", keys)
             self.assertIn("top_k=64", keys)
-            code, b = self.req("/settings", {"defaults": {"temperature": 1.0, "top_p": 0.9, "top_k": 0, "min_p": 0}})
-            self.assertEqual((code, b["defaults"]["top_k"]), (200, 0), b)
             with urllib.request.urlopen(self.base + "/health", timeout=30) as resp:
                 self.assertEqual(json.loads(resp.read())["defaults"]["min_p"], 0.02)
         finally:
@@ -1751,43 +1737,9 @@ class SharedSettings(unittest.TestCase):
         keys = StrataEngine.sampling_keys(self.engine.last_sampling)
         for k in ("penalty_repeat=1.2", "penalty_freq=0.3", "penalty_present=0.4", "penalty_last_n=64"):
             self.assertIn(k, keys)
-        code, b = self.req("/settings", {"defaults": {"temperature": 1.0, "repetition_penalty": 1.1, "presence_penalty": 0.5}})
-        self.assertEqual((code, b["defaults"]["repetition_penalty"], b["defaults"]["presence_penalty"]), (200, 1.1, 0.5), b)
+        self.svc.shared = {"temperature": 1.0, "repetition_penalty": 1.1, "presence_penalty": 0.5}
         self.chat()
         self.assertIn("penalty_repeat=1.1", StrataEngine.sampling_keys(self.engine.last_sampling))
-        code, b = self.req("/settings", {"defaults": {"repetition_penalty": 0}})
-        self.assertEqual(code, 400)
-
-    def test_off_again(self):
-        self.req("/settings", {"defaults": {"temperature": 0.3}})
-        code, b = self.req("/settings", {"defaults": None})
-        self.assertEqual((code, b["shared"]), (200, False))
-        self.assertFalse(os.path.exists(self.svc.shared_path))
-        self.chat()
-        self.assertNotIn("temperature", self.engine.last_sampling)
-
-    def test_only_strata_s_own_page_may_set_them(self):
-        code, _ = self.req("/settings", None, {"Content-Type": "text/plain"}, raw=b'{"defaults": {"temperature": 1}}')
-        self.assertEqual(code, 415)
-        code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://evil.example"})
-        self.assertEqual(code, 403)
-        code, b = self.req("/settings", {"defaults": {"temperature": 9}})
-        self.assertEqual(code, 400)
-        self.assertIn("temperature", b["error"]["message"])
-        self.assertEqual(self.svc.shared, {})
-        host = self.base.split("://", 1)[1]
-        code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://" + host})
-        self.assertEqual(code, 200)
-
-    def test_they_need_the_key_when_one_is_set(self):
-        self.svc.api_key = "secret"
-        try:
-            self.assertEqual(self.req("/settings", {"defaults": {"temperature": 1}})[0], 401)
-            self.assertEqual(self.req("/settings", {"defaults": {"temperature": 1}},
-                                      {"Authorization": "Bearer secret"})[0], 200)
-        finally:
-            self.svc.api_key = ""
-
 
 class CorsOptIn(unittest.TestCase):
     """The config's cors_origins: a page on another origin (a local chat client) may call /v1/* from a browser - only the
@@ -1876,12 +1828,12 @@ class CorsOptIn(unittest.TestCase):
         self.assertEqual((code, h.get("Access-Control-Allow-Origin")), (200, "*"))
         self.assertIsNone(h.get("Vary"))
 
-    def test_settings_and_the_page_itself_stay_closed(self):
+    def test_context_setting_and_unknown_route_stay_closed(self):
         self.svc.cors_origins = [self.PAGE]
         code, h, _ = self.call("OPTIONS", "/settings", {"Origin": self.PAGE})
         self.assertEqual(code, 403)
         self.assertIsNone(h.get("Access-Control-Allow-Origin"))
-        code, h, _ = self.call("POST", "/settings", {"Origin": self.PAGE}, {"defaults": {"temperature": 1}})
+        code, h, _ = self.call("POST", "/api/context", {"Origin": self.PAGE}, {"defaults": {"temperature": 1}})
         self.assertEqual(code, 403)                      # a listed page may chat, it may not change the settings
         self.assertIsNone(h.get("Access-Control-Allow-Origin"))
         code, h, _ = self.call("GET", "/", {"Origin": self.PAGE})
@@ -1910,7 +1862,7 @@ class CorsOptIn(unittest.TestCase):
                 parse_cors_origins(bad)
 
 
-class WebApp(unittest.TestCase):
+class DiscoveryAndMetrics(unittest.TestCase):
     """The web app (PR #22's dashboard idea, rebuilt): its page and files, and GET /metrics."""
 
     @classmethod
@@ -1933,34 +1885,6 @@ class WebApp(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.headers.get("Content-Type", ""), e.read()
 
-    def test_page_and_files(self):
-        code, ctype, body = self.get("/")
-        self.assertEqual(code, 200)
-        self.assertIn("text/html", ctype)
-        self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
-        for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
-                           ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
-            with self.subTest(path=path):
-                code, ctype, _ = self.get(path)
-                self.assertEqual(code, 200)
-                self.assertIn(want, ctype)
-
-    def test_the_model_shown_model_first(self):
-        """/health's model_label - "MiniMax M3.1 · Maya-XS", from the config's installer record (maya_quants), configs
-        of earlier releases too - is what the sidebar shows; the API's model id stays as it was."""
-        import maya_quants
-        old = {"exe": "/m/build/maya-mm3", "args": ["--pack", "/m/X/maya-mm3"], "model_name": "minimax-m3.1-flash",
-               "installer": {"family": "minimax", "quant": "MiniMax-M3.1-Flash-Maya-XS", "mm3_quant": "gguf-xs"}}
-        self.svc.model_label = maya_quants.config_label(old)
-        try:
-            health = json.loads(self.get("/health")[2])
-        finally:
-            self.svc.model_label = None
-        self.assertEqual((health["model_label"], health["model"]), ("MiniMax M3.1 · Maya-XS", self.svc.model))
-        self.assertIsNone(json.loads(self.get("/health")[2])["model_label"])   # (a hand-written config: the id)
-        side = (ROOT / "serve/web/sidebar.js").read_text(encoding="utf-8")   # (the sidebar's model card)
-        self.assertIn("S.health.model_label || modelName(S.health.model)", side)
-
     def test_text_file_limit_follows_the_context(self):
         """#635: /health tells the chat page how big a text file the context holds (about 4 bytes a token, 512 KB to
         16 MB); the page reads it instead of a fixed 512 KB."""
@@ -1972,36 +1896,20 @@ class WebApp(unittest.TestCase):
         self.assertEqual(text_file_limit(0), 512 * 1024)
         health = json.loads(self.get("/health")[2])
         self.assertEqual(health["max_text_file"], text_file_limit(health["max_context"]))
-        page = (ROOT / "serve/web/chats.js").read_text(encoding="utf-8")
-        self.assertIn("S.health.max_text_file", page)
-        self.assertNotIn("MAX_TEXT_FILE", page)
 
-    def test_home_screen_start_url(self):
-        """The manifest's start_url and scope resolve to the page, not to /web/ (iOS's Add to Home Screen opened a 404);
-        an icon saved with the old /web/ is sent to the page."""
-        code, _, body = self.get("/web/manifest.webmanifest")
-        self.assertEqual(code, 200)
-        man = json.loads(body)
-        base = self.base + "/web/manifest.webmanifest"
-        for key in ("start_url", "scope"):
-            self.assertEqual(urllib.parse.urljoin(base, man[key]), self.base + "/")
-        for path, loc in (("/web/", "../"), ("/web", "./"), ("/web/?q=hi", "../?q=hi")):
-            with self.subTest(path=path):
-                conn = http.client.HTTPConnection(self.base.split("//")[1], timeout=10)
-                conn.request("GET", path)
-                r = conn.getresponse()
-                self.assertEqual((r.status, r.getheader("Location")), (302, loc))
-                conn.close()
-                self.assertEqual(urllib.parse.urljoin(self.base + path, loc).split("?")[0], self.base + "/")
-        code, _, body = self.get("/web/")   # (followed: the page)
-        self.assertEqual(code, 200)
-        self.assertIn(b"\"web/app.js\"", body)
-
-    def test_only_the_app_files_are_served(self):
-        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
-                     "/fonts/missing.woff2", "/fonts/x.ttf"):
-            with self.subTest(path=path):
+    def test_legacy_dashboard_routes_are_gone(self):
+        for path in ("/", "/web/app.js", "/api/catalog", "/api/models", "/api/savings", "/api/turbo",
+                     "/api/report", "/api/port", "/settings", "/v1/strata/stream"):
+            with self.subTest(method="GET", path=path):
                 self.assertEqual(self.get(path)[0], 404)
+        for path in ("/api/chat", "/api/models/switch", "/api/tokens", "/api/update", "/attach"):
+            with self.subTest(method="POST", path=path):
+                request = urllib.request.Request(self.base + path, data=b"{}",
+                                                 headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(request, timeout=10)
+                with error.exception as reply:
+                    self.assertEqual(reply.code, 404)
 
     def test_metrics(self):
         data = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}).encode()
@@ -2103,7 +2011,7 @@ class WebApp(unittest.TestCase):
         try:
             self.assertEqual(self.get("/metrics")[0], 401)
             self.assertEqual(self.get("/metrics", {"Authorization": "Bearer secret"})[0], 200)
-            self.assertEqual(self.get("/")[0], 200)                  # the page itself asks for the key
+            self.assertEqual(self.get("/health")[0], 200)
         finally:
             self.svc.api_key = ""
 
@@ -2347,63 +2255,6 @@ class RequestBodies(unittest.TestCase):
 
     def test_the_listen_backlog(self):
         self.assertGreaterEqual(self.httpd.request_queue_size, 256)
-
-class TestCarryEmbeddings(unittest.TestCase):
-    def test_the_job_thread_sees_the_request_threads_image_file(self):
-        local = threading.local()
-        local.path = "req-1.sve"                       # set by the request thread while it prepares the prompt
-        seen = []
-
-        def chunks():
-            seen.append(getattr(local, "path", None))  # what Service.generate reads when the engine call starts
-            yield "chunk"
-
-        gen = carry_embeddings(local, local.path, chunks())
-        worker = threading.Thread(target=lambda: list(gen))   # the strata_resume job thread
-        worker.start()
-        worker.join()
-        self.assertEqual(seen, ["req-1.sve"])
-
-
-class VisionFootprint(unittest.TestCase):
-    """The on-demand encoder's measurement: a failed or malformed one, or a damaged vision-memory.json, is no
-    measurement (the encoder runs on the CPU), never a server that does not start."""
-
-    def setUp(self):
-        import tempfile
-        self.tmp = tempfile.TemporaryDirectory()
-        d = Path(self.tmp.name)
-        (d / "mmproj.gguf").write_bytes(b"x")
-        self.cache = d / "vision-memory.json"
-        self.vcfg = {"exe": "maya-vision", "mmproj": str(d / "mmproj.gguf"), "model": "vocab.gguf",
-                     "max_tokens": 1024}
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def measure(self, returncode, stdout):
-        from unittest import mock
-        from serve.server import vision_footprint
-        done = mock.Mock(returncode=returncode, stdout=stdout)
-        with mock.patch("serve.server.subprocess.run", return_value=done) as run:
-            got = vision_footprint(self.vcfg, {}, self.cache, 0)
-        return got, run.call_count
-
-    def test_a_failed_warm_up_is_no_measurement(self):
-        self.cache.write_text("[]")                    # not the dict it writes
-        self.assertEqual(self.measure(1, "ERR the vision encoder's warm-up encoded nothing\n"), (None, 1))
-
-    def test_a_malformed_mem_line_is_no_measurement(self):
-        self.assertEqual(self.measure(0, "MEM 12\n"), (None, 1))
-        self.assertEqual(self.measure(0, "MEM a b c\n"), (None, 1))
-
-    def test_a_damaged_cache_entry_is_measured_again(self):
-        self.measure(0, "MEM 1000 2000 100000\n")      # the key it writes
-        key = next(iter(json.loads(self.cache.read_text())))
-        self.cache.write_text(json.dumps({key: {"bytes": "1", "total": 100000}}))
-        self.assertEqual(self.measure(0, "MEM 1000 2000 100000\n"), ((1024, 3000 + (256 << 20)), 1))
-        self.assertEqual(self.measure(0, ""), ((1024, 3000 + (256 << 20)), 0))   # now from the cache
-
 
 class LifecycleEngine(MockEngine):
     """The mock engine with StrataEngine's lifecycle: alive / close (QUIT) / restart, counted."""

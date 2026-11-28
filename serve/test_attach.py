@@ -349,7 +349,7 @@ class ApiParts(unittest.TestCase):
 
 
 class Route(unittest.TestCase):
-    """POST /attach and the APIs' file parts against the mock engine (no GPU, no vision)."""
+    """The APIs' file parts against the mock engine (no GPU, no vision)."""
 
     def setUp(self):
         tok = ByteTokenizer()
@@ -371,20 +371,6 @@ class Route(unittest.TestCase):
             with e:
                 return e.code, json.loads(e.read())
 
-    def test_attach_a_word_document(self):
-        s, j = self.call("/attach", docx(), {"Content-Type": "application/octet-stream",
-                                             "X-File-Name": "Q3%20report%C3%A9.docx"})
-        self.assertEqual((s, j["kind"], j["format"]), (200, "text", "Word document"))
-        self.assertIn("North | 42", j["text"])
-
-    def test_foreign_page_refused(self):
-        s, j = self.call("/attach", b"hi", {"Content-Type": "application/octet-stream", "Origin": "http://evil.example"})
-        self.assertEqual(s, 403)
-
-    def test_form_types_refused(self):
-        s, _ = self.call("/attach", b"a=b", {"Content-Type": "application/x-www-form-urlencoded"})
-        self.assertEqual(s, 415)
-
     def test_health_says_videos(self):
         with urllib.request.urlopen(self.base + "/health", timeout=30) as resp:
             self.assertIs(json.loads(resp.read())["videos"], False)        # (the mock engine has no vision)
@@ -396,9 +382,6 @@ class Route(unittest.TestCase):
             {"type": "file", "file": {"filename": "w.txt", "file_data": url}}]}]}).encode()
         s, j = self.call("/v1/chat/completions", body, {"Content-Type": "application/json"})
         self.assertEqual(s, 200, j)
-        s, j = self.call("/api/tokens", json.dumps({"messages": [{"role": "user", "content": "x"}]}).encode(),
-                         {"Content-Type": "application/json"})
-        self.assertEqual(s, 200)
 
     def test_bad_file_part_is_a_400(self):
         body = json.dumps({"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [

@@ -12,7 +12,7 @@ RUN cmake -S . -B /build -G Ninja -DSTRATA_BUILD_TESTS=OFF \
 
 FROM scratch AS bundle
 COPY --from=build /build/tintero /build-ik2/tintero
-COPY VERSION LICENSE* maya.py setup.py maya.sh /
+COPY VERSION LICENSE* maya.py maya.sh setup.sh /
 COPY third_party/ggml/LICENSE /LICENSE.ggml
 COPY third_party/ciru/LICENSE /LICENSE.ciru
 COPY third_party/ciru/NOTICE /NOTICE.ciru
@@ -24,6 +24,7 @@ COPY data/ /data/
 COPY docs/inkling2-mini/ /docs/inkling2-mini/
 COPY docs/PRESETS.md /docs/
 COPY docker/requirements.txt docker/entrypoint.sh /
+COPY docker/prepare-config.py docker/healthcheck.py /docker/
 
 FROM rocm/dev-ubuntu-24.04:7.2
 RUN apt-get update && apt-get install -y --no-install-recommends python3-venv libgomp1 hipblas && rm -rf /var/lib/apt/lists/*
@@ -33,4 +34,6 @@ ENV PATH="/opt/venv/bin:$PATH" \
     TINTERO_CONFIG=docs/inkling2-mini/ik2-mini-gfx1100.json
 RUN python3 -m venv /opt/venv && pip install --no-cache-dir -r requirements.txt && python3 serve/server.py --help >/dev/null
 EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15m --start-interval=2s \
+    CMD ["python3", "docker/healthcheck.py"]
 ENTRYPOINT ["/opt/tintero/entrypoint.sh"]

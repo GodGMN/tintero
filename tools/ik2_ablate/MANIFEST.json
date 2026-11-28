@@ -1,0 +1,77 @@
+{
+  "about": "File inventory of tools/ik2_ablate/ by name only. runtime_assets are shipped (docker/package-ik2-gfx1100.sh copies directions/ to ablate/ in the service image); development_only files stay in the repository and are left out of release bundles and images (.dockerignore, docker/stage-ik2-tools.sh). tools/test_ik2_ablate_packaging.py fails when a file is in neither list.",
+  "runtime_assets": [
+    "directions/v21-pc4.f32",
+    "directions/v21-pc4.json"
+  ],
+  "development_only": {
+    "shell_wrappers": [
+      "bench-q.sh",
+      "bench.sh",
+      "final-bench.sh",
+      "grade-sweep.sh",
+      "grader.sh",
+      "lab.sh",
+      "model-q.sh",
+      "py",
+      "stock-q.sh",
+      "sweep.sh"
+    ],
+    "python_scripts": [
+      "apply_lora_gguf.py",
+      "ask.py",
+      "bake.py",
+      "build_distill_prompts.py",
+      "cap_code.py",
+      "capm.py",
+      "code16.py",
+      "colab_train_lora.py",
+      "cyber_bench.py",
+      "evalq.py",
+      "evalr.py",
+      "final.py",
+      "final2.py",
+      "fit.py",
+      "fit_ortho.py",
+      "fitm.py",
+      "gen_distill_answers.py",
+      "grade.py",
+      "he_all.py",
+      "label.py",
+      "means.py",
+      "mmlu.py",
+      "pi_bench.py",
+      "preset.py",
+      "refm.py",
+      "refnone.py",
+      "variants.py"
+    ],
+    "notebooks": [
+      "colab_inkling_lora.ipynb"
+    ]
+  },
+  "retained_wrappers": {
+    "about": "lab.sh and py carry machine-specific paths and stay because other lab wrappers call them; they are development-only and not shipped. Retire them together with the wrappers below.",
+    "lab.sh": {
+      "referenced_by": [
+        "tools/ik2_ablate/bench-q.sh",
+        "tools/ik2_ablate/bench.sh",
+        "tools/ik2_ablate/final-bench.sh",
+        "tools/ik2_ablate/model-q.sh",
+        "tools/ik2_ablate/stock-q.sh",
+        "tools/ik2_ablate/sweep.sh",
+        "docs/HIP-PORT.md"
+      ]
+    },
+    "py": {
+      "referenced_by": [
+        "tools/ik2_ablate/bench-q.sh",
+        "tools/ik2_ablate/bench.sh",
+        "tools/ik2_ablate/final-bench.sh",
+        "tools/ik2_ablate/model-q.sh",
+        "tools/ik2_ablate/stock-q.sh",
+        "tools/ik2_ablate/sweep.sh"
+      ]
+    }
+  }
+}

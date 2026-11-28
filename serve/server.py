@@ -3,17 +3,9 @@
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
     python -m serve.server --engine maya --config maya.json --port 8080   (the real engine, resident)
 
-Endpoints: POST /v1/chat/completions and /v1/responses (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), POST /tokenize and /detokenize, GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
-Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
-ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
-Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
-data, http(s) URLs or local file paths) go through `maya-vision` (the model's mmproj file) and reach the engine as
-embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
-converted to PNG first with Pillow.  DeepSeek-V4.1 (maya-ds4, `INFO vision=ds4`) runs its vision tower in the engine:
-the server only resizes the pictures (serve/ds4_vision.py) and sends their pixels with `GENI`; so does
-MiniMax-M3.1-Flash (maya-mm3 with --vision on, `INFO vision=mm3`, serve/mm3_vision.py) and Hy4-flash (maya-hy4 with a
-pack that has the mmproj file, `INFO vision=hy4`, serve/hy4_vision.py).
+OpenAI Chat Completions and Responses, Anthropic Messages, model discovery, tokenization,
+health and metrics. Optional MCP tools and an external vision encoder use the server config.
+
 Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
@@ -51,40 +43,15 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
-from serve import attach, mixed_gpus  # noqa: E402
-from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
-
-ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
-#                                                          (hy4_vision.Vision is an mm3_vision.Vision)
-HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
-HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
-# (... and what stands for a picture in a tool result then: the agent's turn goes on)
-HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
-
-
-def hy4_tool_pictures_noted(messages: list) -> list:
-    """Hy4-Flash with no vision tower loaded: the pictures (and videos) in tool results - an agent read an image file,
-    a tool took a screenshot - as a short text note, so the agent's turn goes on instead of failing at every retry.
-    A user's picture is left: the 400 that says why."""
-    out = []
-    for m in messages:
-        c = m.get("content")
-        if m.get("role") == "tool" and isinstance(c, list) and \
-                any(isinstance(i, dict) and i.get("type") in ("image", "video") for i in c):
-            m = {**m, "content": [{"type": "text", "text": HY4_PICTURE_NOTE}
-                                  if isinstance(i, dict) and i.get("type") in ("image", "video") else i for i in c]}
-        out.append(m)
-    return out
+from serve import attach, gpu_map, loop_guard  # noqa: E402
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
                             EFFORT_WORDS, QWEN_EFFORT, INK_CALL, INK_END, INK_MODEL, INK_TEXT, INK_THINK,
                             InklingRewriter, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
-                            deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
                             unmark_literals, LiteralMemo)
@@ -94,11 +61,8 @@ from serve.responses import (ResponseStore, input_items, input_page, normalize_r
 from serve.response_config import ENV_KEYS as RESPONSE_ENV_KEYS, limits_from_env  # noqa: E402
 from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
 from serve.response_store import StoreBusy  # noqa: E402
-from serve.update import RESTART_EXIT, Updater  # noqa: E402
-from serve import glm_dsa_product, glm_dsa_tune  # noqa: E402  (GLM-5.3, glm-dsa: the pack test, its release gate, its knobs)
-from serve.glm_dsa_template import reads_images  # noqa: E402
+from serve.update import Updater  # noqa: E402
 import maya_names  # noqa: E402  (tools/) the settings' names users see (MAYA_*) and the older ones the code reads
-import maya_quants  # noqa: E402  (tools/) the quants' names users see (the model first: "GLM-5.3-Flash · Maya-S")
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
     MAYA_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip() or None
@@ -173,16 +137,11 @@ def nvml_pids(pid: int | None, listed: set) -> set:
         return {pid}
 
 
-# the dashboard's Context size range (serve/models.py: the Models page's Engine settings offer the same one)
-CONTEXT_MIN, CONTEXT_FALLBACK_MAX = models.CONTEXT_MIN, models.CONTEXT_FALLBACK_MAX
-CONTEXT_TESTED, CONTEXT_TESTED_DEFAULT = models.CONTEXT_TESTED, models.CONTEXT_TESTED_DEFAULT
-# the engine log's lines a report carries (maya.py's --report reads the same ones)
-REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|ERR|error|"
-                          r"failed|out of memory|WARNING", re.I)
+CONTEXT_MIN, CONTEXT_FALLBACK_MAX = 4096, 262144
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
-CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+CTX_SLACK = 8
 TEXT_FILE_MIN, TEXT_FILE_MAX = 512 * 1024, 16 * 1024 * 1024
 
 
@@ -706,11 +665,11 @@ def model_management_setting(cfg: dict | None, env=None) -> bool:
 
 
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
-    """The loop guard (serve/loop_guard.py), on unless MAYA_LOOP_GUARD (MAYA_LOOP_GUARD) says 0 / off / false / no
+    """The loop guard (serve/loop_guard.py), on unless TINTERO_LOOP_GUARD says 0 / off / false / no
     or the run config has "loop_guard": false; the environment, when set, wins over the config."""
     off = ("0", "off", "false", "no", "none")
     env = os.environ if env is None else env
-    v = maya_names.lookup(env, "MAYA_LOOP_GUARD")   # (main: MAYA_* aliased, the config's env applied)
+    v = maya_names.lookup(env, "MAYA_LOOP_GUARD")
     if v is not None and str(v).strip():
         return str(v).strip().lower() not in off
     v = (cfg or {}).get("loop_guard")
@@ -989,6 +948,7 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
+        self.protocol_ready = False
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
         self.model_path = paths.get("--native") or paths.get("--pack") or paths.get("--model", "pack/full")
@@ -999,8 +959,6 @@ class StrataEngine:
         if log:
             threading.Thread(target=narrate_start, args=(log, log_start, args, loading),
                              daemon=True).start()
-        if Path(str(exe)).stem.lower() == "maya-hy4":   # (the Models page: the cards' VRAM in use without the engine's own)
-            models.hy4_note_before_start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
@@ -1054,6 +1012,7 @@ class StrataEngine:
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
+        self.protocol_ready = True
 
     def _context_cost(self, offset: int):
         """What this start's context costs in VRAM, from the GLM engine's own start lines ("CUDA0 VRAM before the
@@ -1198,6 +1157,9 @@ class StrataEngine:
 
     def alive(self) -> bool:
         return not getattr(self, "ended", False) and self.proc.poll() is None
+
+    def ready(self) -> bool:
+        return self.protocol_ready and self.alive()
 
     def _activity(self):
         """(CPU seconds, disk bytes read + written) the engine process has used so far; None without psutil."""
@@ -1392,7 +1354,6 @@ class StrataEngine:
             sn = tune.get("spec_n_min")   # ... drafts it keeps whatever their confidence
             if isinstance(sn, int) and not isinstance(sn, bool) and 0 <= sn <= 15:
                 tune_keys += f" spec_n_min={sn}"
-            tune_keys += glm_dsa_tune.engine_keys(tune)   # GLM-5.3's engine knobs (nothing without them)
         bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
         bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
                     if isinstance(bias, dict) and bias else "")
@@ -1903,13 +1864,9 @@ class Vision:
     are cached by the source's hash, so a conversation that sends the same picture again (every turn, with most
     clients) encodes it once.
 
-    On demand (start=False, `lend`/`reclaim` set - the GLM engine's VLEND / VRECLAIM): no process until a picture
-    needs encoding; the engine first empties the tail of its expert cache on the first GPU and frees it, the encoder
-    starts in that memory, and once the request's pictures are encoded (`active()`) it ends and the engine takes the
-    memory back.  The decode keeps the whole cache between pictures (~18% faster on Mercury than with the encoder
-    resident), for a second or two of start-up per request with new pictures."""
+    """
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None):
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
         if cfg.get("gpu"):
             args.append("--gpu")
@@ -1922,69 +1879,18 @@ class Vision:
         self.args, self.log, self.env = args, log, env
         self.dir = Path(tempfile.mkdtemp(prefix="maya-vision-"))
         self.proc = None
-        self.lend = self.reclaim = None   # on demand: callables (the engine's VLEND / VRECLAIM), wired by main()
-        self.owed = False                 # the engine's memory is not back yet (a reclaim that kept failing)
         self.lock = threading.RLock()
         self.cache: dict[str, tuple[Path, int]] = {}
-        if start:
-            self._start()
+        self._start()
 
     def _start(self):
-        if self.lend is not None:
-            self.settle()
-            self.lend()
-        try:
-            self.proc = subprocess.Popen(self.args + (["--no-warmup"] if self.lend is not None else []),
-                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                         stderr=self.log or subprocess.DEVNULL, text=True, encoding="utf-8",
-                                         bufsize=1, env=self.env)
-            line = self.proc.stdout.readline()
-            if not line.startswith("READY"):
-                raise RuntimeError("the vision encoder did not start: " + line.strip())
-        except Exception:
-            self._stop()
-            raise
-
-    def _stop(self):
-        if self.proc is not None:
-            try:
-                self.proc.stdin.write("QUIT\n")
-                self.proc.stdin.flush()
-                self.proc.wait(timeout=10)
-            except Exception:
-                self.proc.kill()
-                self.proc.wait()
-            self.proc = None
-        if self.reclaim is not None:
-            self.owed = True
-            for _ in range(40):          # the driver frees an ended process's memory within moments
-                if self.settle():
-                    return
-                time.sleep(0.25)
-            print("[maya] the vision encoder's GPU memory is not back yet: prompts are read token by token until "
-                  "it is", flush=True)
-
-    def settle(self) -> bool:
-        """The engine takes back the memory an earlier encode borrowed (true when nothing is owed)."""
-        if not self.owed:
-            return True
-        try:
-            self.reclaim()
-            self.owed = False
-        except ValueError:
-            pass
-        return not self.owed
-
-    @contextlib.contextmanager
-    def active(self):
-        """The request's pictures are encoded inside: an on-demand encoder ends at the exit and the engine has its
-        memory back before the request runs."""
-        with self.lock:
-            try:
-                yield self
-            finally:
-                if self.lend is not None and self.proc is not None:
-                    self._stop()
+        self.proc = subprocess.Popen(self.args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=self.log or subprocess.DEVNULL, text=True, encoding="utf-8",
+                                     bufsize=1, env=self.env)
+        line = self.proc.stdout.readline()
+        if not line.startswith("READY"):
+            self.close()
+            raise RuntimeError("the vision encoder did not start: " + line.strip())
 
     @staticmethod
     def load(source: str) -> bytes:
@@ -2134,53 +2040,16 @@ class Vision:
             self.proc.kill()
 
 
-def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
-    """(image token cap, bytes) for the on-demand vision encoder on THIS machine's first GPU: measured once by
-    `maya-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
-    and GPU.  A cap the config does not set is the largest of 4096 / 2048 / 1024 image tokens whose footprint stays
-    within 15% of the card (a 32 GB card keeps 4096, an 8-12 GB card gets 1024).  None: no GPU to measure on, or
-    no measurement (the encoder failed or printed no well-formed MEM line)."""
+def trained_context(model_path: Path) -> int | None:
+    """Read the declared context length from the configured GGUF's header."""
+    from gguf_reader import GGUFFile
+
     try:
-        cache = json.loads(cache_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        cache = {}
-    if not isinstance(cache, dict):                     # a hand-edited or damaged file: measured again
-        cache = {}
-    st = Path(vcfg["mmproj"]).stat()
-    caps = [int(vcfg["max_tokens"])] if vcfg.get("max_tokens") else [4096, 2048, 1024]
-    for i, cap in enumerate(caps):
-        key = f"{Path(vcfg['mmproj']).resolve()}|{st.st_size}|{int(st.st_mtime)}|gpu{gpu}|cap{cap}|" \
-              f"fa{0 if vcfg.get('no_flash_attn') else 1}"
-        m = cache.get(key)
-        if not isinstance(m, dict) or not all(isinstance(m.get(k), int) and m[k] > 0 for k in ("bytes", "total")):
-            m = None
-        if m is None:
-            args = [vcfg["exe"], "--mmproj", vcfg["mmproj"], "--model", vcfg["model"], "--gpu", "--max-tokens", str(cap),
-                    "--measure"] + (["--no-flash-attn"] if vcfg.get("no_flash_attn") else [])
-            print(f"[maya] images: measuring the vision encoder on this GPU ({cap} image tokens) ...", flush=True)
-            try:
-                r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=env)
-                # only a measurement that ran to its end (an encoder whose warm-up failed exits 1 without one)
-                f = next((l.split() for l in r.stdout.splitlines() if l.startswith("MEM ")), None) \
-                    if r.returncode == 0 else None
-            except (OSError, subprocess.TimeoutExpired):
-                f = None
-            if f is None or len(f) != 4 or not all(x.isdigit() for x in f[1:]) or int(f[3]) == 0:
-                return None
-            # its weights and work buffers, the context this process had (and whatever else used the card then -
-            # the safe side), and 256 MB of slack
-            m = cache[key] = {"bytes": int(f[1]) + int(f[2]) + (256 << 20), "total": int(f[3])}
-            try:
-                cache_file.write_text(json.dumps(cache, indent=1), encoding="utf-8")
-            except OSError:
-                pass
-        if len(caps) == 1 or m["bytes"] <= 0.15 * m["total"] or i == len(caps) - 1:
-            return cap, int(m["bytes"])
-    return None
-
-
-trained_context = models.trained_context            # (the context a model was trained for: serve/models.py)
-trained_context_ds4 = models.trained_context_ds4
+        metadata = GGUFFile(model_path).metadata
+    except (OSError, ValueError, EOFError, KeyError, IndexError, struct.error):
+        return None
+    context = metadata.get(f"{metadata.get('general.architecture', '')}.context_length")
+    return context if isinstance(context, int) and context > 0 else None
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -2231,17 +2100,6 @@ def child_env(cfg: dict) -> dict:
     # engine settings the config carries (AMD: the GEMM tuning table), under BOTH names: env_in left the config with the
     # older STRATA_ one, and some of the engines' settings are read by their MAYA_ name alone (issue #686)
     maya_names.export_env(env, cfg.get("env"))
-    # DeepSeek's fast prompt reading (the config's "fast_prefill", the Models page's switch, --fast-prefill on|off):
-    # the long prompt's skip as a per-layer cone in maya-ds4 (DS4_YOCO_CONE).  Opt-in - the same sums, but a kernel's
-    # choice goes by its row count, so the bits (and an answer) can shift slightly; a config without it: the engine's
-    # default (off)
-    if isinstance(cfg.get("fast_prefill"), bool):
-        env["DS4_YOCO_CONE"] = "1" if cfg["fast_prefill"] else "0"
-    # Hy4-flash's CPU lane: whether its 4-bit expert copies pay is measured once on this PC (the engine's timed turns,
-    # once its experts are warm) and remembered in the data folder beside the expert profiles - per PC, model and
-    # lane kernels (maya --speed-calibration measures again)
-    if models.family(cfg) == "hy4":
-        env.setdefault("HY4_Q4X_FILE", str(HY4_LANE_FILE))
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -2600,8 +2458,7 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.default_effort = None                    # the run config's `reasoning_effort`: a request without one
-        self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
-        self.shared_path = None                       # where they are kept between starts (next to the config)
+        self.shared = {}                              # defaults from older installs, if present
         self.fifo = FairLock()
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -2632,20 +2489,14 @@ class Service:
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.config_path = None                          # the run config (a context change is saved into it)
-        self.savings = None                              # serve/savings.py's Ledger: what the API would have charged
-        self.model_dir = None                            # the model's folder (free disk on the dashboard)
+        self._config_lock = threading.Lock()             # serialize context and thinking budget writes
         self.model_label = None                          # what runs, as users see it: "MiniMax M3.1 · Maya-XS"
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
-        self.lookup = None                               # DeepSeek's prompt lookup (--suffix-draft above 0); the others' INFO says
-        self.dspark = None                               # DeepSeek's: drafts with its DSpark blocks (its engine's INFO
-        #                                                  does not say: the config's --dspark and the pack's drafter)
         self.reload = None                               # a context change: {state, from, to, started, error}
         # "idle_unload_s" / --idle-unload (as Strata's): after this long without a request the engine ends, giving back
         # its GPU memory and its pinned RAM tier, and the next request starts it again (0: never).  With
         # MAYA_GLM_SLOT_KEEP=1 the conversation in the model is kept on disk across it.
         self.idle_unload_s = 0.0
-        self.keep_alive_s = None                          # a request's keep_alive (None: idle_unload_s; -1: never)
-        self.puller = None                               # serve/model_pull.py: the one model download (the Models page, /api/pull)
         self.unloaded = False                            # the engine was ended by the idle unload (not by a crash)
         self._engine_start = threading.Lock()            # ensure_engine: one start, also with --parallel's requests
         self.updater = Updater(MAYA_VERSION)             # About > Updates: a newer release, and updating to it
@@ -2682,8 +2533,7 @@ class Service:
         self.think_budget = 0
         # GLM-5.3 (glm-dsa), a request that asks for Max itself (the owner, 2026-11-07): up to this budget in
         # think_budget's place (run(): as far as its room allows, THINK_LONG_RESERVE) while think_budget is the default
-        # (main sets it: maya_quants.GLM53_MAX_THINK_BUDGET); a budget the user sets on the dashboard clears it.  0 = the
-        # same budget at every level (every other model)
+        # Zero uses the same budget at every level.
         self.think_budget_max = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         # (Hy4-flash with its suffixed </think:..>, which the pack's tokenizer names </think> in what the server reads)
@@ -2802,19 +2652,6 @@ class Service:
         prompt, plain = unmark_literals(prompt, self.literals)
         return self.tok.encode(prompt + suffix, parse_special=True, plain=plain)
 
-    def set_shared(self, defaults) -> dict:
-        """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
-        self.shared = clean_shared_defaults(defaults)
-        if self.shared_path:
-            try:
-                if self.shared:
-                    Path(self.shared_path).write_text(json.dumps(self.shared, indent=1), encoding="utf-8")
-                else:
-                    Path(self.shared_path).unlink(missing_ok=True)
-            except OSError as e:
-                print(f"[maya] could not save the shared settings: {e}", flush=True)
-        return self.shared
-
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
@@ -2850,25 +2687,6 @@ class Service:
                     part.close()
             except Exception as e:  # noqa: BLE001 - ending anyway
                 print(f"[maya] stopping {type(part).__name__}: {e}", flush=True)
-
-    def alone_reason(self, sampling: dict, pictures) -> str | None:
-        """Two GPUs (serve/mixed_gpus.py): why this request runs on the AMD GPU alone - None: on both."""
-        if not hasattr(self.engine, "use"):
-            return None
-        if pictures:
-            return "has pictures"
-        if logprobs_asked(sampling) is not None:
-            return "asks for log-probabilities"
-        if sampling.get("ablate", self.sampling_defaults.get("ablate")) is True:
-            return "uses refusal ablation"
-        return None
-
-    def engine_for(self, alone: str | None):
-        """Two GPUs: the engines for this request (the caller holds the FIFO) - see MixedEngine.use."""
-        use = getattr(self.engine, "use", None)
-        if use is not None:
-            with self._engine_start:
-                use(alone)
 
     def ensure_engine(self):
         """The engine running (the caller holds the FIFO): started again after an idle unload, or after it died in an
@@ -2926,12 +2744,8 @@ class Service:
             self.fifo.release()
 
     def idle_limit(self) -> float:
-        """Seconds without a request before the model unloads: the last request's keep_alive, else the config's
-        idle_unload_s; 0 = never."""
-        ka = self.keep_alive_s
-        if ka is None:
-            return self.idle_unload_s
-        return 0.0 if ka < 0 else ka
+        """Seconds without a request before the model unloads. Zero keeps it resident."""
+        return self.idle_unload_s
 
     def start_idle_unload(self):
         if not hasattr(self.engine, "close"):
@@ -2965,7 +2779,9 @@ class Service:
     def context_limits(self) -> dict:
         """The dashboard's Context size: the range it offers and the engine's measured cost of the current one."""
         info = dict(getattr(self.engine, "info", {}) or {})
-        rng = models.context_range(self.trained_context, self.engine.max_context, str(info.get("engine_kind") or ""))
+        rng = {"min": CONTEXT_MIN,
+               "max": max(self.trained_context or CONTEXT_FALLBACK_MAX, self.engine.max_context),
+               "trained": self.trained_context, "tested": CONTEXT_FALLBACK_MAX}
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         # a streamed cache's RAM (KV streaming: maya-mm3's VRAM lines' kv_ram - every position's K / V in pinned RAM,
@@ -3046,34 +2862,20 @@ class Service:
         if not self.config_path:
             return
         try:
-            p = Path(self.config_path)
-            cfg = json.loads(p.read_text(encoding="utf-8-sig"))
-            inst = cfg.setdefault("installer", {})       # (the first change from the page: what the setup wrote first,
-            if "as_set_up" not in inst:                  #  the Models page's Reset - as models.save keeps it)
-                inst["as_set_up"] = models.settings_of(cfg)
-            args = list(cfg.get("args") or [])
-            if "--max-context" in args[:-1]:
-                args[args.index("--max-context") + 1] = str(int(n))
-            else:
-                args += ["--max-context", str(int(n))]
-            cfg["args"] = args
-            tmp = p.with_name(p.name + ".tmp")
-            tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-            os.replace(tmp, p)
+            with self._config_lock:
+                p = Path(self.config_path)
+                cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+                args = list(cfg.get("args") or [])
+                if "--max-context" in args[:-1]:
+                    args[args.index("--max-context") + 1] = str(int(n))
+                else:
+                    args += ["--max-context", str(int(n))]
+                cfg["args"] = args
+                tmp = p.with_name(p.name + ".tmp")
+                tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                os.replace(tmp, p)
         except (OSError, ValueError) as e:
             print(f"[maya] could not save the new context in {self.config_path}: {e}", flush=True)
-
-    def text_only(self) -> str | None:
-        """GLM-5.3 (glm-dsa) has no vision tower at all: its name for the words of the attachments and the page ("...
-        reads text only"); None for every other model (images there are a setup's or a setting's choice).  Hy4-Flash
-        the same while its engine has no vision tower loaded (--vision off, a pack without one, or a card with no room
-        for a picture beside the model)."""
-        tpl = getattr(self, "template", None)
-        if getattr(self, "vision", None) is None and getattr(tpl, "hy4", False):
-            return HY4_TEXT_ONLY
-        if getattr(self, "vision", None) is None and getattr(tpl, "glm_dsa", False) and not reads_images(tpl.source):
-            return glm_dsa_product.LABEL
-        return None
 
     def supports_thinking_budget(self) -> bool:
         return self.think_end_id is not None or getattr(self, "native_inkling_guard", False)
@@ -3095,376 +2897,26 @@ class Service:
         return s.get("_think_max") is True and not s.get("_level_shared") and s.get("strata_level_default") is not True
 
     def set_think_budget(self, value) -> dict:
-        """The dashboard's Thinking budget: 0 or 256..262144 tokens.  It applies from the next request (think_budget is
-        read per request, no restart) and is saved into the run config - marked as the user's own, so a setup or a
-        switch keeps it."""
+        """Apply the budget for subsequent requests and save it to the run config if present."""
         if not self.supports_thinking_budget():
             raise ValueError("this model has no thinking budget")
-        n = maya_quants.check_thinking_budget(value)
-        self.think_budget = n
-        self.think_budget_max = 0                   # (the user's own budget: every level, GLM-5.3's Max too)
-        saved = False
-        if self.config_path:
-            p = Path(self.config_path)
-            cfg = json.loads(p.read_text(encoding="utf-8-sig"))
-            cfg["thinking_budget"] = n
-            cfg.setdefault("installer", {})["thinking_budget_set"] = True
-            tmp = p.with_name(p.name + ".tmp")
-            tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-            os.replace(tmp, p)
-            saved = True
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not (
+                value == 0 or 256 <= value <= 262144 and value == int(value)):
+            raise ValueError("the thinking budget is 0 (no limit) or a whole number from 256 to 262144 tokens")
+        n = int(value)
+        with self._config_lock:
+            saved = bool(self.config_path)
+            if saved:
+                p = Path(self.config_path)
+                cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+                cfg["thinking_budget"] = n
+                tmp = p.with_name(p.name + ".tmp")
+                tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                os.replace(tmp, p)
+            self.think_budget = n
+            self.think_budget_max = 0
         print(f"[maya] thinking budget: {n or 'no limit'}" + (" (saved)" if saved else ""), flush=True)
         return {"budget": n, "supported": True, "saved": saved}
-
-    def port_info(self) -> dict:
-        """The dashboard's Port: where the server listens, and whether a new port can apply at once (maya.py started
-        this server and starts it again on the saved port) or only from the next start."""
-        host, port = getattr(self, "listen", None) or ("127.0.0.1", None)
-        return {"port": port, "host": host, "restarts": bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
-                "saved": bool(self.config_path), "restarting": getattr(self, "port_restart", None)}
-
-    def set_port(self, n: int) -> dict:
-        """The dashboard's Port: n saved into the run config (and Maya's start scripts for it), then - when maya.py
-        started this server - the server ends with RESTART_EXIT after the request in flight, and maya.py starts it again
-        on n.  The port must be free on this server's address now (a busy one: an error, nothing saved)."""
-        host, port = getattr(self, "listen", None) or ("127.0.0.1", None)
-        if not 1024 <= n <= 65535:
-            raise ValueError("the port must be a number from 1024 to 65535")
-        if n == port:
-            raise ValueError(f"Maya listens on {n} already")
-        if not self.config_path:
-            raise ValueError("this server runs without a config, so a port cannot be saved: start it with --port")
-        if getattr(self, "port_restart", None):
-            raise ValueError("Maya is already moving to another port")
-        import socket
-        try:
-            with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind((host, n))
-        except OSError as e:
-            raise ValueError(f"port {n} is in use or not allowed here ({e.strerror or e})") from None
-        self._save_port(n)
-        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
-        if restarts:
-            self.port_restart = n
-            threading.Thread(target=self._restart_on_port, args=(n,), daemon=True).start()
-        print(f"[maya] the port {n} is saved" + (": Maya starts again on it" if restarts else
-              " - it applies from the next start"), flush=True)
-        return {"port": n, "restarts": restarts}
-
-    def _restart_on_port(self, n: int):
-        time.sleep(0.5)                                  # (the answer to the page goes out first)
-        with self.fifo:                                  # the request in flight finishes first
-            print(f"[maya] starting again on port {n} ...", flush=True)
-            self.close_for_restart()
-            os._exit(RESTART_EXIT)
-
-    def _save_port(self, n: int):
-        """"port" in the run config, and --port in Maya's start scripts beside it that start this config (setup writes
-        run-maya-<model>.bat / .sh with the port then chosen; a script would otherwise move it back)."""
-        p = Path(self.config_path)
-        cfg = json.loads(p.read_text(encoding="utf-8-sig"))
-        cfg["port"] = int(n)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-        os.replace(tmp, p)
-        for script in list(p.parent.glob("run-*.bat")) + list(p.parent.glob("run-*.sh")):
-            try:
-                raw = script.read_bytes()                # (bytes: a .bat keeps its CR LF line ends)
-                if p.name.encode() not in raw:
-                    continue
-                new = re.sub(rb"(--port\s+)\d+", lambda m: m.group(1) + str(int(n)).encode(), raw)
-                if new != raw:
-                    script.write_bytes(new)
-            except OSError as e:
-                print(f"[maya] could not change the port in {script.name}: {e}", flush=True)
-
-    # -------------------------------------------------------------- the Models page (serve/models.py)
-    def models_root(self) -> Path:
-        """Where the configs are: beside this server's own (maya.py's folder)."""
-        return Path(self.config_path).parent if self.config_path else ROOT
-
-    def models_info(self) -> dict:
-        """The configs the setup wrote, the running one marked, each with its engine settings; whether a switch or a
-        change to the running one can start Maya again at once (maya.py started this server)."""
-        out = models.listing(self.models_root(), self.config_path)
-        out.update(restarts=bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
-                   running=Path(self.config_path).name if self.config_path else None,
-                   restarting=getattr(self, "model_restart", None),
-                   deleted=getattr(self, "deleted", None),          # (the model running before, deleted at this start)
-                   loaded=not hasattr(self.engine, "alive") or bool(self.engine.alive()),
-                   can_unload=all(hasattr(self.engine, x) for x in ("close", "restart", "alive")),
-                   pull=self.pull_slot().snapshot(),                # (the download running now, or the last one)
-                   leftovers=models.leftovers(self.models_root()))
-        return out
-
-    def _model_path(self, name) -> Path:
-        name = str(name or "")
-        p = self.models_root() / name
-        if (not re.fullmatch(r"maya-[^/\\]+\.json", name) or name.endswith(".shared-settings.json")
-                or not p.is_file()):
-            raise ValueError(f"no model config named {name!r} here")
-        return p
-
-    def _is_running(self, p: Path) -> bool:
-        return bool(self.config_path) and p.resolve() == Path(self.config_path).resolve()
-
-    def _restart_busy(self):
-        if getattr(self, "model_restart", None) or getattr(self, "port_restart", None):
-            raise ValueError("Maya is already starting again")
-        if self.reloading() or self.updater.busy():
-            raise ValueError("Maya is reloading or updating; try again when it is done")
-
-    def model_settings(self, name, settings, dry_run: bool = False) -> dict:
-        """The engine settings of the config `name` (the Models page): checked, and unless dry_run saved into it.  The
-        running model's start Maya again with them (when maya.py started this server), after the request in flight;
-        another model's apply when it is switched to.  dry_run: the command they make, nothing saved."""
-        p = self._model_path(name)
-        cfg = models.read(p)
-        if not cfg:
-            raise ValueError(f"{p.name}: not a config Maya can read")
-        new = models.apply(cfg, settings)                 # (a ValueError: what is wrong, nothing saved)
-        if dry_run:
-            return {"command": models.command(new), "settings": models.shown_settings(new)}
-        running = self._is_running(p)
-        if running:
-            self._restart_busy()
-        out = models.save(p, settings)
-        if running and "ablate" in settings:   # (refusal ablation's default: live - no restart, the engine has it)
-            self.sampling_defaults = {k: v for k, v in self.sampling_defaults.items() if k != "ablate"}
-            if models.ablate_default(new):
-                self.sampling_defaults["ablate"] = True
-        restarts = bool(running and out["changed"] and os.environ.get("MAYA_RESTART_ON_UPDATE"))
-        if restarts:
-            self._restart_into(p, "settings")
-        print(f"[maya] {p.name}: engine settings saved" + (": Maya starts again with them" if restarts else
-              " - they apply from its next start" if out["changed"] else " (nothing changed)"), flush=True)
-        return {**out, "running": running, "restarts": restarts}
-
-    def turbo_info(self) -> dict:
-        """The Turbo button: whether it is on, what switching it on changes in the engine's settings, and whether this
-        server can start the engine again by itself.  A server with no run config (--config) has only the request-level
-        half: the page's greedy decoding, thinking and prompts."""
-        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
-        if not self.config_path:
-            return {"on": bool(getattr(self, "turbo_mem", False)), "engine": False, "plan": {}, "env": {},
-                    "restarts": False, "family": None}
-        cfg = models.read(Path(self.config_path))
-        return {**models.turbo_info(cfg), "engine": True, "restarts": restarts,
-                "restarting": getattr(self, "model_restart", None)}
-
-    def set_turbo(self, on: bool) -> dict:
-        """Turbo on or off.  The engine's part (models.turbo_enable / turbo_disable: the context, the expert skipping, the
-        drafting, written into the run config) starts Maya again as a saved engine setting does, after the request in
-        flight; nothing to restart where the engine already runs so (or without a run config)."""
-        if not self.config_path:
-            self.turbo_mem = bool(on)
-            return self.turbo_info()
-        p = Path(self.config_path)
-        self._restart_busy()
-        out = models.turbo_enable(p) if on else models.turbo_disable(p)
-        restarts = bool(out["changed"] and os.environ.get("MAYA_RESTART_ON_UPDATE"))
-        if restarts:
-            self._restart_into(p, "settings")
-        print(f"[maya] Turbo {'on' if on else 'off'}: {p.name}" + (": Maya starts again" if restarts else
-              " - the engine settings apply from its next start" if out["changed"] else " (the engine needs no restart)"),
-              flush=True)
-        return {**self.turbo_info(), "restarting_now": restarts, "changed": out["changed"]}
-
-    def switch_model(self, name) -> dict:
-        """The Models page's Switch: the config `name` becomes the most recently used one (a start without --config
-        picks it), and when maya.py started this server it ends with RESTART_EXIT after the request in flight, leaving
-        maya.py a note (models.SWITCH_FILE) to start that config, on this port."""
-        p = self._model_path(name)
-        if self._is_running(p):
-            raise ValueError(f"{p.name} is the model running now")
-        cfg = models.read(p)
-        why = models.missing(cfg)                        # (maya.py would stop at it: no model would run)
-        if why:
-            raise ValueError(f"{p.name} cannot start: {why} - run the setup again to repair it")
-        self._restart_busy()
-        if models.own_defaults(p):                       # (its model's own sampling and level, as the setup writes)
-            print(f"[maya] {p.name}: its model's own sampling and thinking level written into it", flush=True)
-        os.utime(p)
-        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
-        if restarts:
-            self._restart_into(p, "switch")
-        print(f"[maya] {p.name} is the model to start" + (": Maya starts again with it" if restarts else
-              " next (a start without --config picks it)"), flush=True)
-        return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": restarts}
-
-    def delete_model(self, name, files: bool = False, dry_run: bool = False, then=None) -> dict:
-        """The Models page's Delete: the config `name` off the list (models.delete), with `files` what its setup
-        downloaded for it as well.  Not while Maya starts again.  The model running: Maya switches to `then` first, and
-        the next server deletes it (models.DELETE_FILE) once the engine that ran from it is gone.  dry_run: what would
-        go (models.delete_plan), nothing deleted."""
-        p = self._model_path(name)
-        running = self._is_running(p)
-        if getattr(self, "model_restart", None):
-            raise ValueError("Maya is starting again; try again when it is done")
-        if dry_run:
-            return {"file": p.name, "running": running, **models.delete_plan(self.models_root(), p)}
-        if files and self.pull_slot().busy():            # (the download may be writing into the same folder)
-            raise ValueError("a model is downloading; delete its files when it is done")
-        if running:
-            return self._delete_running(p, files, then)
-        out = models.delete(self.models_root(), p, bool(files))
-        print(f"[maya] {p.name} deleted" + (f", and its files ({out['freed'] / 2**30:.1f} GB)" if files else
-              " (its files stay)"), flush=True)
-        return out
-
-    def _delete_running(self, p: Path, files: bool, then) -> dict:
-        if not then:
-            raise ValueError(f"{p.name} is the model running now: pick the model Maya switches to first")
-        if not os.environ.get("MAYA_RESTART_ON_UPDATE"):
-            raise ValueError("this server was not started by maya.sh or START-MAYA.bat, so it cannot switch to another "
-                             f"model by itself: start another model, then delete {p.name}")
-        if files:                                        # (checked now: the next server only reports)
-            plan = models.delete_plan(self.models_root(), p)
-            if not plan["ok"]:
-                raise ValueError(plan["why"])
-        cfg = models.read(p)                             # (its name, for the page once the config is gone)
-        note = self.models_root() / models.DELETE_FILE
-        note.write_text(json.dumps({"config": str(p.resolve()), "files": bool(files), "time": time.time(),
-                                    "model": cfg.get("model_name") or "", "quant": models.quant_label(cfg, p)}),
-                        encoding="utf-8")
-        try:
-            out = self.switch_model(then)                # (its checks: not this one, can start, not busy)
-        except BaseException:
-            note.unlink(missing_ok=True)
-            raise
-        print(f"[maya] {p.name} is deleted once {out['to']} runs" + (", with its files" if files else ""), flush=True)
-        return {"deleting": p.name, "to": out["to"], "files": bool(files), "restarts": True}
-
-    def finish_delete(self):
-        """The model that ran before this start, deleted now that another one runs (the Models page deleted the
-        running one: its note, models.DELETE_FILE, read once).  self.deleted says how it went, for the page."""
-        note_path = self.models_root() / models.DELETE_FILE
-        try:
-            note = json.loads(note_path.read_text(encoding="utf-8"))
-            note_path.unlink()
-        except (OSError, ValueError):
-            return
-        p = Path(str(note.get("config") or ""))
-        if time.time() - float(note.get("time") or 0) > 900 or not p.is_file() or p.parent != self.models_root():
-            return                                       # (stale, gone already, or not one of these configs)
-        if self._is_running(p):                          # (the switch did not happen: it runs again)
-            self.deleted = {"file": p.name, "error": "it is the model running now", "time": time.time()}
-            print(f"[maya] {p.name} not deleted: it is the model running now", flush=True)
-            return
-        try:
-            out = models.delete(self.models_root(), p, bool(note.get("files")))
-        except (OSError, ValueError) as e:
-            self.deleted = {"file": p.name, "error": str(e), "time": time.time()}
-            print(f"[maya] {p.name} not deleted: {e}", flush=True)
-            return
-        self.deleted = {**out, "model": note.get("model") or "", "quant": note.get("quant") or "", "time": time.time()}
-        print(f"[maya] {p.name} deleted" + (f", and its files ({out['freed'] / 2**30:.1f} GB)" if out["files"] else
-              " (its files stay)"), flush=True)
-
-    def pull_slot(self):
-        """The model download slot (serve/model_pull.py); MAYA_PULL_COMMAND (a JSON list with {model}) replaces the
-        setup's command - a test hook."""
-        if self.puller is None:
-            def command(ident, cfg):
-                hook = os.environ.get("MAYA_PULL_COMMAND")
-                if not hook:
-                    return model_pull.setup_command(ident, cfg)
-                return [a.replace("{model}", ident) for a in json.loads(hook)]
-            self.puller = model_pull.Puller(self.models_root(), command)
-        return self.puller
-
-    def pull_model(self, ident) -> dict:
-        cfg = models.read(Path(self.config_path)) if self.config_path else None
-        return self.pull_slot().start(ident, cfg).snapshot()
-
-    def delete_installed(self, name) -> dict:
-        """DELETE /api/delete and the Models page: the model's config and its own files (models.delete_plan
-        never lists a file another config runs from).  Not the running model, not during a download."""
-        p = model_api.find_config(self.models_root(), name)
-        if p is None:
-            raise KeyError(name)
-        if self._is_running(p):
-            raise ValueError(f"{p.name} is the model running now: load another model first")
-        if self.pull_slot().busy():
-            raise ValueError("a model is downloading; delete when it is done")
-        return self.delete_model(p.name, True)
-
-    def model_listing(self) -> list:
-        return models.listing(self.models_root(), self.config_path)["models"]
-
-    def expires_at(self):
-        limit = self.idle_limit()
-        return (self.last_request_at or self.started_at) + limit if limit else None
-
-    def delete_leftover(self, path) -> dict:
-        """The Models page's files no model uses: one deleted (models.delete_leftover)."""
-        out = models.delete_leftover(self.models_root(), path)
-        print(f"[maya] {out['deleted']} deleted ({out['freed'] / 2**30:.1f} GB): no model here used it", flush=True)
-        return out
-
-    def _restart_into(self, p: Path, why: str):
-        _, port = getattr(self, "listen", None) or ("127.0.0.1", None)
-        note = {"config": str(p.resolve()), "port": port, "why": why, "time": time.time()}
-        (self.models_root() / models.SWITCH_FILE).write_text(json.dumps(note), encoding="utf-8")
-        self.model_restart = {"to": p.name, "why": why, "started": time.time()}
-        threading.Thread(target=self._restart_for_models, args=(p.name, why), daemon=True).start()
-
-    def _restart_for_models(self, name: str, why: str):
-        time.sleep(0.5)                                  # (the answer to the page goes out first)
-        with self.fifo:                                  # the request in flight finishes first
-            print(f"[maya] starting again with {name} ..." if why == "switch" else
-                  f"[maya] starting again with {name}'s new engine settings ...", flush=True)
-            self.close_for_restart()
-            os._exit(RESTART_EXIT)
-
-    def storage(self) -> dict | None:
-        """The model's folder and the free space on its drive (About)."""
-        if not self.model_dir:
-            return None
-        try:
-            import shutil
-            u = shutil.disk_usage(self.model_dir)
-            return {"path": str(self.model_dir), "free": u.free, "total": u.total}
-        except OSError:
-            return None
-
-    def report(self) -> str:
-        """A plain-text report for an issue (the dashboard's Copy report): versions, this PC, the engine's facts, the
-        run config without its secrets, and the engine log's telling lines."""
-        tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "static": {}}
-        hw, st = tel.get("now") or {}, tel.get("static") or {}
-        gib = lambda b: f"{b / 2**30:.1f} GB" if isinstance(b, (int, float)) else "?"  # noqa: E731
-        import platform
-        out = [f"Project Maya {MAYA_VERSION or '?'} - report of {time.strftime('%Y-%m-%d %H:%M')}",
-               f"System: {platform.platform()}, Python {platform.python_version()}",
-               f"GPU: {st.get('gpu_name') or 'not readable'} ({gib(hw.get('gpu_mem_total'))} VRAM)",
-               f"CPU: {st.get('cpu_name') or '?'}, {st.get('threads') or '?'} threads; RAM {gib(hw.get('ram_total'))}",
-               f"Model: {self.model}" + (f" ({self.model_label})" if self.model_label else "") +
-               f", context {self.engine.max_context}"]
-        info = dict(getattr(self.engine, "info", {}) or {})
-        if info:
-            out.append("Engine: " + " ".join(f"{k}={v}" for k, v in sorted(info.items())))
-        if self.config_path:
-            try:
-                cfg = json.loads(Path(self.config_path).read_text(encoding="utf-8-sig"))
-                secret = re.compile(r"key|token|secret|password", re.I)
-                env = {maya_names.shown(k): ("***" if secret.search(k) else v) for k, v in (cfg.get("env") or {}).items()}
-                out.append(f"Config: {Path(self.config_path).name}: args {' '.join(map(str, cfg.get('args') or []))}; "
-                           f"gpu {cfg.get('gpu')}; env {json.dumps(env)}")
-            except (OSError, ValueError):
-                pass
-        log = getattr(self.engine, "log_path", None)
-        if log:
-            try:
-                with open(log, "rb") as f:
-                    f.seek(0, 2)
-                    f.seek(max(0, f.tell() - (2 << 20)))
-                    lines = f.read().decode("utf-8", "replace").splitlines()
-                keep = [ln for ln in lines if REPORT_LINES.search(ln)]
-                out += ["", f"Engine log ({log}), the telling lines of the last 2 MB:"] + keep[-150:]
-            except OSError:
-                pass
-        return "\n".join(out) + "\n"
 
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
@@ -3599,10 +3051,9 @@ class Service:
         engine = {"model": self.model, "model_label": self.model_label, "max_context": self.engine.max_context,
                   "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
-                  "trained_context": self.trained_context,
-                  **({"dspark": self.dspark} if self.dspark is not None else {})}
+                  "trained_context": self.trained_context}
         # the drafters on (empty: drafting is off): the Monitor's Speculation says "off", or the draft acceptance
-        engine["speculation"] = speculation_modes(engine, lookup=self.lookup)
+        engine["speculation"] = speculation_modes(engine)
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -3620,8 +3071,7 @@ class Service:
                 "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "loop_guard": guard, "hardware": hw,
                 "hardware_static":
-                tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage(),
-                "savings": self.savings.summary() if self.savings is not None else None}
+                tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": None, "savings": None}
 
     def _gpu_map(self, cards):
         """What fills each GPU (serve/gpu_map.py): the engine's VRAM lines and NVML's cards, with the engine's and the
@@ -3835,49 +3285,10 @@ class Service:
             keep = self._keep_suffix(tools, kwargs)
             if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
-        if getattr(self.template, "hy4", False) and getattr(self, "vision", None) is None:
-            messages = hy4_tool_pictures_noted(messages)   # (a tool result's picture: a text note, not a 400)
         ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
         self.embeddings.path = None
         media = media_of(messages)
-        if media and self.text_only() and getattr(self.template, "glm_dsa", False) and \
-                not media_of([m for m in messages if m.get("role") != "tool"]):
-            # GLM-5.3 (glm-dsa, text only): pictures in tool results alone (an agent read an image file, a tool took a
-            # screenshot) - its template already wrote its own note in their place ("You are unable to process this
-            # image ..."), so the agent's turn goes on instead of failing every retry; a user's picture is the 400 below
-            media = []
-        images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
-                  else [src for kind, src in media if kind == "image"])
-        if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
-            # the engines' own vision towers (DeepSeek, MiniMax, Hy4) read pictures only: say so instead of dropping
-            # the video (with a picture next to it) or failing on a missing video encoder (without one)
-            raise ValueError(("Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
-                              "MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
-                             + " reads pictures, not videos")
-        if images and isinstance(self.vision, ENGINE_VISION):
-            # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
-            # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
-            pics = []
-            for src in images:
-                if cancel is not None and cancel.is_set():
-                    raise ValueError("image preparation was cancelled")
-                pics.append(self.vision.picture(src))
-            if cancel is not None and cancel.is_set():
-                raise ValueError("image preparation was cancelled")
-            ids, starts = self.vision.expand(ids, pics)
-            self.embeddings.path = self.vision.write(self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.dsi", pics,
-                                                     starts)
-        elif media:
-            if self.vision is None and getattr(self.template, "glm_dsa", False) and not reads_images(self.template.source):
-                # GLM-5.3 (glm-dsa) has no vision tower: say so plainly - there is no encoder to choose
-                raise ValueError(f"{self.model} reads text only, so it cannot read images: send the request without "
-                                 "the image parts (describe the picture in text instead)")
-            if self.vision is None and getattr(self.template, "hy4", False):
-                # Hy4-Flash with no vision tower loaded (--vision off, a pack without the mmproj file, or a card with
-                # no room for a picture beside the model: the engine's start says which)
-                raise ValueError(f"{HY4_TEXT_ONLY} reads text only (Images on the Models page turns them on where "
-                                 "the card has room for a picture beside the model), so it cannot read images or "
-                                 "videos: send the request without them (describe the picture in text instead)")
+        if media:
             inkling = getattr(self.template, "inkling", False)
             if self.vision is None and inkling:
                 # Inkling 2: tintero has no vision tower of its own (the GGUF leaves it out); with a "vision" entry in
@@ -3889,8 +3300,7 @@ class Service:
             if inkling and any(kind == "video" for kind, _ in media):
                 raise ValueError(f"{self.model} reads pictures, not videos")
             if self.vision is None:
-                raise ValueError("this server was started without the vision encoder (run setup again and choose "
-                                 "'vision'), so it cannot read images or videos")
+                raise ValueError("this server was started without a vision encoder, so it cannot read images or videos")
             # the template's media markers: GLM-5.3 writes <|begin_of_image|><|image|><|end_of_image|> and
             # <|begin_of_video|><|video|><|end_of_video|>, Qwen <|vision_start|><|image_pad|><|vision_end|> and
             # <|vision_start|><|video_pad|><|vision_end|>
@@ -3917,15 +3327,12 @@ class Service:
             with self._turn([False, False], cancel, units=None):
                 if cancel is not None and cancel.is_set():
                     raise ValueError("image preparation was cancelled")
-                self.ensure_engine()                     # (the encoder borrows the engine's memory: it must run)
-                self.engine_for("has pictures")          # (two GPUs: pictures are read on the AMD GPU alone)
-                with self.vision.active():
-                    enc = []
-                    for kind, src in media:
-                        if cancel is not None and cancel.is_set():
-                            raise ValueError("image preparation was cancelled")
-                        enc.append((kind, self.vision.encode(src) if kind == "image"
-                                    else self.vision.encode_video(src)))
+                self.ensure_engine()
+                enc = []
+                for kind, src in media:
+                    if cancel is not None and cancel.is_set():
+                        raise ValueError("image preparation was cancelled")
+                    enc.append((kind, self.vision.encode(src) if kind == "image" else self.vision.encode_video(src)))
                 if cancel is not None and cancel.is_set():
                     raise ValueError("image preparation was cancelled")
             literal = self.tok.encode(image_pad, parse_special=False)
@@ -4030,28 +3437,6 @@ class Service:
             raise ValueError("detokenize needs tokens as a list of token ids")
         text = self.tok.decode(ids)
         return {"content": text, "prompt": text}
-
-    def count_tokens(self, req: dict) -> dict:
-        """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
-        tools and tokenizer as prepare(), with nothing run (no image encoder: a picture or a video counts as its
-        marker, so the count is approximate then).  The web app's context meter."""
-        messages, tools, kw = self.chat_prompt(req)
-        if getattr(self.template, "deepseek", False) or isinstance(self.vision, mm3_vision.Vision):
-            # (DeepSeek, MiniMax: the engine's own vision tower - a picture's span is its resize's)
-            sources = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
-                       else [src for kind, src in media_of(messages) if kind == "image"])
-            n, approximate = len(self.render_ids(messages, tools, kw)), bool(sources)
-            if sources and isinstance(self.vision, ENGINE_VISION):
-                try:
-                    n += sum(self.vision.picture(src).tokens - 1 for src in sources)
-                    approximate = False
-                except (ValueError, OSError):
-                    pass
-            return {"tokens": n, "images": len(sources), "approximate": approximate,
-                    "max_context": self.engine.max_context}
-        media = media_of(messages)
-        return {"tokens": len(self.render_ids(messages, tools, kw)), "images": len(media),
-                "approximate": bool(media), "max_context": self.engine.max_context}
 
     @staticmethod
     def _say_malformed(parser):
@@ -4674,10 +4059,7 @@ class Service:
                     return
                 if self.stopping:
                     raise ValueError("the server is stopping: send the request again once the model is back")
-                if self.vision is not None and self.vision.owed:   # memory an encode borrowed, not back yet
-                    self.vision.settle()
                 self.ensure_engine()   # after an idle unload, or issue #27: it died in an earlier request
-                self.engine_for(self.alone_reason(sampling, emb))   # (two GPUs: what runs on the AMD GPU alone)
                 with self.status_lock:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), tool=None, tail="", max_tokens=max_new)
@@ -5035,7 +4417,6 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-            book = None                                 # (the savings' count: after the lock, it writes a file)
             with self.status_lock:
                 self.current_requests.discard(stat)
                 if counted:
@@ -5069,7 +4450,6 @@ class Service:
                     t["prompt_tokens"] += len(ids)
                     t["reused"] += last.get("reused") or 0
                     t["output_tokens"] += n
-                    book = (len(ids), last.get("reused") or 0, n)
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
                     if calls:
@@ -5094,8 +4474,6 @@ class Service:
                     hold[1] = False
                     self.active -= 1
                 self.status["busy"] = self.active > 0
-            if book is not None and self.savings is not None:
-                self.savings.add(*book)
         was = parser.state
         for ev in with_lp(parser.finish(), was):
             yield "event", ev
@@ -5375,14 +4753,6 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             yield last
 
 
-def carry_embeddings(local, path, chunks):
-    """`Service.embeddings` is thread-local (the request thread prepares the prompt and sets the image embeddings
-    file).  A strata_resume answer runs its chunks on the job thread, which would see no file: the image's place
-    in the prompt then went to the engine as plain pad tokens and the model answered about a black / blank picture."""
-    local.path = path                                  # runs on the thread that first pulls from the generator
-    yield from chunks
-
-
 def watch_client(handler, cancel: threading.Event, every: float = 0.5) -> None:
     """A request's client watched on its own thread (#314): an API request writes nothing while it waits in the queue,
     and a non-streamed one nothing until its answer is done, so a client that timed out or went away was only noticed
@@ -5409,163 +4779,6 @@ def watch_client(handler, cancel: threading.Event, every: float = 0.5) -> None:
             except (OSError, ValueError):               # (closed by this server: the request is done)
                 return
     threading.Thread(target=watch, name="client-watch", daemon=True).start()
-
-
-class StreamJob:
-    """A web-app answer that outlives its connection (the request's `strata_resume`): a thread runs its chunks into
-    `items` and any reader streams them from an index (GET /v1/strata/stream?id=&from=), so a phone whose screen
-    sleeps mid-answer reconnects and carries on instead of losing it.  Only POST /v1/strata/cancel (the app's Stop)
-    cancels it - a dropped connection, or nobody reading it for hours, does not: it runs to its end, and the page
-    takes the whole of it up whenever it comes back (JOBS keeps it for a day after it ends)."""
-
-    def __init__(self, jid: str, chunks, cancel: threading.Event):
-        self.id, self.cancel = jid, cancel
-        self.items: list = []
-        self.done, self.ended = False, None
-        self.readers = 0
-        self.cv = threading.Condition()
-        self.log, self.flushed = job_file(jid), time.time()   # its chunks on disk too: a restart keeps the answer
-        threading.Thread(target=self._run, args=(chunks,), daemon=True, name="strata-job").start()
-
-    @classmethod
-    def restored(cls, jid: str, items: list, ended: float) -> "StreamJob":
-        """An answer read back from its file after a restart: complete, nothing runs."""
-        job = cls.__new__(cls)
-        job.id, job.cancel, job.items = jid, threading.Event(), items
-        job.done, job.ended, job.readers, job.cv = True, ended, 0, threading.Condition()
-        job.log = None
-        return job
-
-    def reader(self, on: bool):
-        with self.cv:
-            self.readers += 1 if on else -1
-
-    def _add(self, c):
-        with self.cv:
-            self.items.append(c)
-            self.cv.notify_all()
-        self._log(c)
-
-    def _run(self, chunks):
-        try:
-            for c in chunks:
-                if c is not None:                      # heartbeats: each reader writes its own
-                    self._add(c)
-        except EngineDied as e:
-            self._add({"error": {"type": "server_error", "message": died_text(e)}})
-        except Exception as e:  # noqa: BLE001 - the engine's ERR after the stream started, or anything else
-            self._add({"error": {"type": "server_error", "message": str(e)}})
-        finally:
-            with self.cv:
-                self.done, self.ended = True, time.time()
-                self.cv.notify_all()
-            self._log({"_done": self.ended}, close=True)
-
-    def _log(self, c, close: bool = False):
-        """One chunk to the answer's file (flushed every 2 s and at the end); a disk that fails only stops the file."""
-        if self.log is None:
-            return
-        try:
-            self.log.write(json.dumps(c, ensure_ascii=False) + "\n")
-            if close or time.time() - self.flushed > 2:
-                self.log.flush()
-                self.flushed = time.time()
-            if close:
-                self.log.close()
-                self.log = None
-        except (OSError, ValueError, TypeError):
-            with contextlib.suppress(OSError, ValueError):
-                self.log.close()
-            self.log = None
-
-    def wait(self, n: int, timeout: float):
-        """The items from index n (waiting up to `timeout` for one) and whether the answer is complete."""
-        with self.cv:
-            if len(self.items) <= n and not self.done:
-                self.cv.wait(timeout)
-            return self.items[n:], self.done
-
-
-JOBS: dict[str, StreamJob] = {}
-JOBS_LOCK = threading.Lock()
-
-
-JOB_KEEP_S = 86400   # a finished web-app answer stays this long for a page that comes back to it (a phone, next day)
-JOB_KEEP_N = 32      # and at most this many finished ones (the oldest go first; a running one is never dropped)
-
-
-JOBS_DIR: Path | None = None   # the answers' files (answers/ beside the config); None: in RAM only
-JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
-RESTARTED = "Maya restarted before this answer ended; this is what it had written."
-
-
-def job_file(jid: str):
-    """A new answer's file, open for appending (None without a folder, or if it cannot be opened)."""
-    if JOBS_DIR is None or not JOB_ID.fullmatch(jid):
-        return None
-    try:
-        return open(JOBS_DIR / f"{jid}.jsonl", "w", encoding="utf-8")
-    except OSError:
-        return None
-
-
-def _jobs_forget(jid: str) -> None:
-    JOBS.pop(jid, None)
-    if JOBS_DIR is not None and JOB_ID.fullmatch(jid):
-        with contextlib.suppress(OSError):
-            (JOBS_DIR / f"{jid}.jsonl").unlink()
-
-
-def jobs_load(folder: Path) -> int:
-    """The answers of the last day back from their files after a (re)start, so a page that comes back to one still
-    gets it; one that was running when the server stopped ends with a note saying so.  Older files are deleted."""
-    global JOBS_DIR
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return 0
-    JOBS_DIR, now, found = folder, time.time(), []
-    for f in folder.glob("*.jsonl"):
-        try:
-            mtime = f.stat().st_mtime
-            if now - mtime > JOB_KEEP_S or not JOB_ID.fullmatch(f.stem):
-                f.unlink()
-                continue
-            items, ended = [], None
-            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
-                try:
-                    c = json.loads(line)
-                except ValueError:
-                    break                                  # (a line cut by the stop)
-                if isinstance(c, dict) and "_done" in c:
-                    ended = c["_done"]
-                    break
-                items.append(c)
-            if ended is None:
-                items.append({"error": {"type": "server_error", "message": RESTARTED}})
-                ended = mtime
-            found.append(StreamJob.restored(f.stem, items, float(ended)))
-        except (OSError, ValueError, TypeError):
-            continue
-    with JOBS_LOCK:
-        for job in sorted(found, key=lambda j: j.ended)[-JOB_KEEP_N:]:
-            JOBS[job.id] = job
-        for job in sorted(found, key=lambda j: j.ended)[:-JOB_KEEP_N]:
-            _jobs_forget(job.id)
-    return min(len(found), JOB_KEEP_N)
-
-
-def jobs_put(job: StreamJob) -> None:
-    """Keeps the running answers and the finished ones of the last day (at most JOB_KEEP_N).  A running answer is
-    never cancelled here: only the page's Stop ends one early."""
-    with JOBS_LOCK:
-        now = time.time()
-        for k in [k for k, j in JOBS.items() if j.done and now - (j.ended or now) > JOB_KEEP_S]:
-            _jobs_forget(k)
-        done = sorted((j for j in JOBS.values() if j.done), key=lambda j: j.ended or now)
-        while done and len(done) >= JOB_KEEP_N:
-            _jobs_forget(done.pop(0).id)
-        JOBS[job.id] = job
 
 
 def openai_collect(chunks, logprobs: bool = False) -> dict:
@@ -5804,7 +5017,7 @@ def make_handler(svc: Service):
                     if total > limit:
                         self.close_connection = True
                         raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
-                                           "(MAYA_MAX_BODY_MIB raises the limit)")
+                                           "(TINTERO_MAX_BODY_MIB raises the limit)")
                     piece = self.rfile.read(size)
                     if len(piece) != size or self.rfile.read(2) != b"\r\n":
                         raise BadBody(400, "malformed chunked request body")
@@ -5818,7 +5031,7 @@ def make_handler(svc: Service):
             if length > limit:
                 self.close_connection = True                 # not read: the connection ends with the answer
                 raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
-                                   "(MAYA_MAX_BODY_MIB raises the limit)")
+                                   "(TINTERO_MAX_BODY_MIB raises the limit)")
             return self.rfile.read(length)
 
         def _json(self, code, obj):
@@ -5833,7 +5046,7 @@ def make_handler(svc: Service):
             """llama.cpp's /models/load and /models/unload: Open WebUI's Models page (load / switch)."""
             if not getattr(svc, "model_management", False):
                 self._json(404, {"error": {"message": "model management is off (remove \"model_management\": false, or "
-                                                      "MAYA_MODEL_MANAGEMENT=1, turns it on)"}})
+                                                      "TINTERO_MODEL_MANAGEMENT=1, turns it on)"}})
                 return
             try:
                 body = json.loads(self._body().decode() or "{}")
@@ -5841,10 +5054,6 @@ def make_handler(svc: Service):
                 body = {}
             name = (body or {}).get("model") or svc.model
             if name != svc.model:
-                other = model_api.find_config(svc.models_root(), name)
-                if op == "load" and other is not None:    # another installed model: the swap (a load on request)
-                    self._mapi_target(name)
-                    return
                 self._json(404, {"error": {"message": "model not found"}})
                 return
             if op == "unload":
@@ -5871,268 +5080,11 @@ def make_handler(svc: Service):
                 svc.fifo.release()
             self._json(200, {"model": name, "status": {"value": "loaded"}})
 
-        # ------------------------------------------------------------ the model API (serve/model_api.py)
-        def _mapi_gate(self, manage: bool = False) -> bool:
-            """Model management on, the API key given when one is set; `manage` (pull, delete, swap): without a key only
-            from this PC - nobody else on the network may download or delete models."""
-            if not getattr(svc, "model_management", False):
-                self._json(404, {"error": "model management is off (remove \"model_management\": false, or "
-                                          "MAYA_MODEL_MANAGEMENT=1, turns it on)"})
-                return False
-            if manage and not svc.api_key:
-                ip = self.client_address[0] if self.client_address else ""
-                if ip not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
-                    self._json(403, {"error": "set an API key to download, delete or switch models over the network"})
-                    return False
-            return True
-
-        def _mapi_json(self) -> dict:
-            req = json.loads(self._body() or b"{}")
-            if not isinstance(req, dict):
-                raise ValueError("the request body must be a JSON object")
-            return req
-
-        def _mapi_ps(self) -> dict:
-            loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
-            out = []
-            run = next((m for m in svc.model_listing() if m["running"]), None)
-            lock = getattr(svc, "_engine_start", None)
-            starting = run is not None and loaded and lock is not None and lock.locked()   # (the weights are loading)
-            if run is not None and loaded and not starting:
-                out.append(model_api.ps_entry(run, svc.expires_at(), 0))
-            res = {"models": out}
-            restart = getattr(svc, "model_restart", None)
-            if restart:
-                res["loading"] = {"model": model_api.public_name(Path(restart["to"])) + ":latest", "since": restart["started"]}
-            elif starting:
-                res["loading"] = {"model": model_api.public_name(Path(run["file"])) + ":latest", "since": time.time()}
-            elif run is not None and not loaded:
-                res["unloaded"] = model_api.public_name(Path(run["file"])) + ":latest"
-            return res
-
-        def _mapi_get(self, path: str):
-            if not self._mapi_gate():
-                return
-            if path == "/api/version":
-                self._json(200, {"version": "0.0.0-maya"})
-            elif path == "/api/tags":
-                self._json(200, {"models": [model_api.tags_entry(m) for m in svc.model_listing()]})
-            elif path == "/api/ps":
-                self._json(200, self._mapi_ps())
-            elif path == "/api/catalog":
-                run = models.read(Path(svc.config_path)) if svc.config_path else None   # (its backend: the files offered)
-                self._json(200, {"models": model_pull.catalog(svc.models_root(), cfg=run), "pull": svc.pull_slot().snapshot(),
-                                 "restarts": bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))})
-            elif path == "/api/pull/status":
-                self._json(200, {"pull": svc.pull_slot().snapshot()})
-
-        def _mapi_post(self, path: str):
-            try:
-                req = self._mapi_json()
-                if path == "/api/show":
-                    name = req.get("model") or req.get("name")
-                    p = model_api.find_config(svc.models_root(), name)
-                    if p is None:
-                        self._json(404, {"error": f"model '{name}' not found"})
-                        return
-                    d = models.describe(p, svc.config_path)
-                    plan = models.delete_plan(svc.models_root(), p) if req.get("verbose") else None
-                    self._json(200, model_api.show_entry(d, plan))
-                elif path == "/api/pull":
-                    if self._mapi_gate(manage=True):
-                        self._pull(req)
-                elif path == "/api/pull/cancel":
-                    if self._mapi_gate(manage=True):
-                        self._json(200, {"cancelled": svc.pull_slot().cancel()})
-                elif path == "/api/delete":
-                    if self._mapi_gate(manage=True):
-                        self._mapi_delete(req)
-                elif path in ("/api/chat", "/api/generate"):
-                    self._mapi_chat(path.rsplit("/", 1)[1], req)
-            except ValueError as e:
-                if self.answer_started:
-                    raise
-                self._json(400, {"error": str(e)})
-
-        def _mapi_delete(self, req: dict):
-            name = req.get("model") or req.get("name")
-            try:
-                out = svc.delete_installed(name)
-            except KeyError:
-                self._json(404, {"error": f"model '{name}' not found"})
-                return
-            except (ValueError, OSError) as e:
-                self._json(409, {"error": str(e)})
-                return
-            self._json(200, {"status": "success", "freed": out["freed"]})
-
-        def _pull(self, req: dict):
-            name = req.get("model") or req.get("name")
-            slot = svc.pull_slot()
-            try:
-                pull = slot.current if slot.busy() and str(name or "").removesuffix(":latest").lower() == slot.current.id \
-                    else slot.start(name, models.read(Path(svc.config_path)) if svc.config_path else None)
-            except ValueError as e:
-                self._json(409 if slot.busy() else 400, {"error": str(e)})
-                return
-            if req.get("detach"):                            # (the Models page: starts it, then polls /api/pull/status)
-                self._json(202, {"pull": pull.snapshot()})
-                return
-            if req.get("stream") is False:
-                last = None
-                for last in model_pull.ndjson_events(pull, 1.0):
-                    pass
-                self._json(200 if last and "error" not in last else 500, last or {"status": "success"})
-                return
-            self._ndjson_start()
-            try:
-                for ev in model_pull.ndjson_events(pull, 1.0):
-                    self.wfile.write((json.dumps(ev) + "\n").encode())
-                    self.wfile.flush()
-            except OSError:
-                pass                                         # (the download goes on without the client)
-
-        def _ndjson_start(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.answer_started = True
-
-        def _mapi_target(self, name) -> bool:
-            """The model a chat / generate names: True when it is the one running (or none named); otherwise the answer
-            is sent - 404, or the swap to that installed model (Maya starts again with it: a 503 + Retry-After says so)."""
-            run = next((m for m in svc.model_listing() if m["running"]), None)
-            if not name or run is None:
-                return True
-            p = model_api.find_config(svc.models_root(), name)
-            if p is None:
-                self._json(404, {"error": f"model '{name}' not found, try pulling it first"})
-                return False
-            if p.name == run["file"]:
-                return True
-            if not self._mapi_gate(manage=True):
-                return False
-            if not getattr(svc, "model_restart", None):
-                if not os.environ.get("MAYA_RESTART_ON_UPDATE"):
-                    self._json(409, {"error": f"{p.name} is installed, but this server was not started by maya.sh or "
-                                              "START-MAYA.bat, so it cannot switch models itself: start it with that model"})
-                    return False
-                try:
-                    svc.switch_model(p.name)
-                except ValueError as e:
-                    self._json(409, {"error": str(e)})
-                    return False
-            body = json.dumps({"error": f"loading model {model_api.public_name(p)}: Maya starts again with it (a big model "
-                                        "takes minutes); retry this request, GET /api/ps shows when it is loaded",
-                               "loading": model_api.public_name(p) + ":latest"}).encode()
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "30")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return False
-
-        def _mapi_chat(self, kind: str, req: dict):
-            """/api/chat and /api/generate through the same pipeline as /v1/chat/completions."""
-            if not self._mapi_gate():
-                return
-            if not self._mapi_target(req.get("model")):
-                return
-            ka = model_api.parse_keep_alive(req.get("keep_alive"))
-            name = model_api.public_name(Path(svc.config_path)) + ":latest" if svc.config_path else svc.model
-            empty = not (req.get("messages") if kind == "chat" else (req.get("prompt") or req.get("images")))
-            if empty:                                          # the preload (load) and its unload (keep_alive 0)
-                if ka == 0:
-                    if svc.unload() == "busy":
-                        self._json(409, {"error": "a request is running or waiting; unload when idle"})
-                        return
-                    reason = "unload"
-                else:
-                    svc.keep_alive_s = ka
-                    svc.fifo.acquire(blocking=True)
-                    try:
-                        svc.ensure_engine()
-                    except Exception as e:  # noqa: BLE001 - the reason goes back to the caller
-                        self._json(503, {"error": f"the engine did not start: {e}"})
-                        return
-                    finally:
-                        svc.fifo.release()
-                    reason = "load"
-                o = {"model": name, "created_at": model_api._iso(time.time()), "done": True, "done_reason": reason}
-                o.update({"message": {"role": "assistant", "content": ""}} if kind == "chat" else {"response": ""})
-                self._json(200, o)
-                return
-            oreq = model_api.chat_to_openai(req) if kind == "chat" else model_api.generate_to_openai(req)
-            svc.keep_alive_s = ka                               # (the model stays loaded that long after this request)
-            oreq = svc.with_shared(oreq, "openai")
-            oreq["_api"] = "openai"
-            svc.check_request(oreq)
-            messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
-            max_new = int(oreq.get("max_tokens") or 0)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(oreq))
-            if kw.get("_prefill"):
-                oreq = {**oreq, "_prefill": kw["_prefill"]}
-            oreq = {**oreq, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume"),
-                    "_think_max": kw.get("_think_max")}         # (GLM-5.3: Max's long budget, Service.asked_max)
-            cancel = threading.Event()
-            watch_client(self, cancel)
-            chunks = openai_chunks(svc, oreq, ids, thinking, tools, max_new, cancel)
-            tr = model_api.Translator(name, kind)
-
-            def line(ev):
-                self.wfile.write((json.dumps(ev, ensure_ascii=False) + "\n").encode())
-            try:
-                if not oreq.get("stream"):
-                    pieces = [ev for c in with_partial(chunks, openai_texts) for ev in tr.feed(c)]
-                    calls = [c for ev in tr.finish_calls() for c in ev["message"]["tool_calls"]]
-                    last = tr.done()
-                    if kind == "chat":
-                        msg = {"role": "assistant", "content": "".join(p["message"]["content"] for p in pieces)}
-                        think = "".join(p["message"].get("thinking", "") for p in pieces)
-                        if think:
-                            msg["thinking"] = think
-                        if calls:
-                            msg["tool_calls"] = calls
-                        last["message"] = msg
-                    else:
-                        last["response"] = "".join(p["response"] for p in pieces)
-                    self._json(200, last)
-                else:
-                    self._ndjson_start()
-                    for c in chunks:
-                        for ev in tr.feed(c):
-                            line(ev)
-                            self.wfile.flush()
-                    for ev in tr.finish_calls() + [tr.done()]:
-                        line(ev)
-                    self.wfile.flush()
-            except OSError:
-                cancel.set()
-                chunks.close()
-            except EngineFault as e:                             # (#827: not streamed - a 422 with what it wrote)
-                if self.answer_started:
-                    line({"error": died_text(e)})
-                else:
-                    self._json(ENGINE_ERROR_STATUS, {"error": died_text(e), "error_type": "engine_error",
-                                                     "partial_text": e.partial_text,
-                                                     **({"partial_thinking": e.partial_reasoning}
-                                                        if e.partial_reasoning else {})})
-            except EngineDied as e:
-                if self.answer_started:
-                    line({"error": died_text(e)})
-                else:
-                    self._json(503, {"error": died_text(e)})
-            finally:
-                if ka == 0:                                      # keep_alive 0: out of memory as soon as it is idle
-                    threading.Thread(target=svc.unload, daemon=True).start()
-
         def _models_sse(self):
             """llama.cpp's /models/sse: the Models page's live state, a snapshot every few seconds."""
             if not getattr(svc, "model_management", False):
                 self._json(404, {"error": {"message": "model management is off (remove \"model_management\": false, or "
-                                                      "MAYA_MODEL_MANAGEMENT=1, turns it on)"}})
+                                                      "TINTERO_MODEL_MANAGEMENT=1, turns it on)"}})
                 return
             if not self._authorized():
                 return
@@ -6300,9 +5252,6 @@ def make_handler(svc: Service):
                 return
             if self.path.split("?")[0].startswith("/v1/responses/"):
                 self._response_resource(delete=True)
-            elif self.path.split("?")[0].rstrip("/") == "/api/delete":
-                if self._authorized():
-                    self._mapi_post("/api/delete")
             elif self._authorized():
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -6311,55 +5260,8 @@ def make_handler(svc: Service):
             if path == "/models/sse":
                 self._models_sse()
                 return
-            if path in ("/api/tags", "/api/ps", "/api/version", "/api/catalog", "/api/pull/status"):
-                if self._authorized():
-                    self._mapi_get(path)
-                return
             if path.startswith("/v1/responses/"):
                 self._response_resource()
-                return
-            if path.startswith("/fonts/"):
-                # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
-                name = path[len("/fonts/"):]
-                f = ROOT / "serve" / "web" / "fonts" / name
-                if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():
-                    self._json(404, {"error": {"message": "not found"}})
-                    return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "font/woff2")
-                self.send_header("Cache-Control", "max-age=86400")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            if path == "/web":
-                # a home-screen icon saved with the manifest's old start_url (/web/): the page is one level up. Relative,
-                # so it still works behind a path-prefixed proxy
-                raw = self.path.split("?")[0]
-                query = self.path[len(raw):]
-                self.send_response(302)
-                self.send_header("Location", ("../" if raw.endswith("/") else "./") + query)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            if path.startswith("/web/"):
-                # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
-                name = path[len("/web/"):]
-                types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                         ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json"}
-                f = ROOT / "serve" / "web" / name
-                ext = os.path.splitext(name)[1]
-                if "/" in name or "\\" in name or ext not in types or not f.is_file():
-                    self._json(404, {"error": {"message": "not found"}})
-                    return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", types[ext])
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
                 return
             if path == "/metrics":
                 if self._authorized():
@@ -6375,23 +5277,12 @@ def make_handler(svc: Service):
                     self.end_headers()
                     self.wfile.write(body)
                 return
-            if path == "/settings":
-                if self._authorized():
-                    self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
-                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
-            if path == "":
-                body = (ROOT / "serve" / "web" / "index.html").read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif path == "/health":
+            if path == "/health":
                 # the run config's recommended settings: the web app's Chat defaults until its user picks their own
                 rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k", "min_p")}
                 if svc.default_effort:   # (MiniMax's and Inkling's by their own names, CYBER-FROST's by Qwen's three)
@@ -6406,8 +5297,11 @@ def make_handler(svc: Service):
                 # Hy4-flash alone: its two levels (the page offers these and no others)
                 levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) else None
                 cache_slots = getattr(svc.engine, "info", {}).get("cache_slots")
-                self._json(200, {"status": "updating" if svc.updater.busy() else
-                                           "reloading" if svc.reloading() else "ok",
+                status = "updating" if svc.updater.busy() else "reloading" if svc.reloading() else "ok"
+                engine_ready = getattr(svc.engine, "ready", getattr(svc.engine, "alive", None))
+                ready = (status == "ok" and not svc.unloaded and svc.engine.max_context > 0
+                         and (engine_ready is None or engine_ready()))
+                self._json(200, {"status": status, "ready": ready,
                                  "max_context": svc.engine.max_context, "model": svc.model,
                                  **({"cache_slots": cache_slots} if cache_slots is not None else {}),
                                  "max_text_file": text_file_limit(svc.engine.max_context),
@@ -6420,12 +5314,7 @@ def make_handler(svc: Service):
                                  # the web chat sends past answers' thinking back (a Qwen3.x template keeps it): the
                                  # history then reads as the model wrote it, and the next turn goes on from there
                                  "history_thinking": bool(getattr(svc.template, "keeps_thinking", False)),
-                                 # refusal ablation: the Chat's switch shows only with a direction loaded; its
-                                 # starting position the model's default (the Models page's)
-                                 "ablate": svc.ablate_state(),
-                                 # GLM-5.3 (glm-dsa) alone: no vision tower at all - the page's attachments say so
-                                 # (not "images are off": no setting turns them on)
-                                 **({"text_only": True} if svc.text_only() else {}),
+                                                          "ablate": svc.ablate_state(),
                                  **({"thinking_levels": levels} if levels else {}),
                                  # GLM-5.3 alone, while its budget is the default: the most a Max its user picks may
                                  # think (the page then marks a level left at the default: strata_level_default)
@@ -6438,36 +5327,11 @@ def make_handler(svc: Service):
             elif path == "/api/thinking-budget":
                 if self._authorized():
                     self._json(200, svc.think_budget_info())
-            elif path == "/api/port":
-                # the dashboard's Port: where the server listens, and whether a new one applies at once
-                if self._authorized():
-                    self._json(200, svc.port_info())
-            elif path == "/api/turbo":
-                # the Turbo button (Settings > Chat defaults): on or off, and what it would change in the engine
-                if self._authorized():
-                    self._json(200, svc.turbo_info())
-            elif path == "/api/models":
-                # the Models page: the configs the setup wrote, the running one, each one's engine settings
-                if self._authorized():
-                    self._json(200, svc.models_info())
-            elif path == "/api/savings":
-                # the sidebar's Saved: what the model's own API would have charged for the same tokens, per model
-                if self._authorized():
-                    self._json(200, svc.savings.report() if svc.savings is not None else {"usd": None, "models": []})
             elif path == "/api/update":
                 # About > Updates: the latest release (GitHub, cached six hours; ?force=1 asks now) and whether this
                 # folder can update itself
                 if self._authorized():
                     self._json(200, svc.updater.check(force="force=1" in self.path))
-            elif path == "/api/report":
-                # the dashboard's Copy report: what an issue needs (the run config's secrets left out)
-                if self._authorized():
-                    body = svc.report().encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
             elif path == "/status":
                 if not self._authorized():   # (it carries `tail`: the last 600 characters written)
                     return
@@ -6516,9 +5380,6 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
-            elif path == "/v1/strata/stream":
-                if self._authorized():
-                    self._job_get()
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -6554,23 +5415,8 @@ def make_handler(svc: Service):
                 if path.startswith("/v1/responses/") and path.endswith("/cancel"):
                     self._response_cancel(path)
                     return
-                if path in ("/api/show", "/api/pull", "/api/pull/cancel", "/api/delete", "/api/chat", "/api/generate"):
-                    self._mapi_post(path)
-                    return
-                if path == "/settings":
-                    self._settings()
-                    return
-                if path in ("/attach", "/pdf"):
-                    self._attach()
-                    return
-                if path == "/v1/strata/cancel":
-                    self._job_cancel()
-                    return
                 if path == "/api/context":
                     self._context()
-                    return
-                if path == "/api/port":
-                    self._port()
                     return
                 if path == "/api/thinking-budget":
                     body = self._body()
@@ -6584,53 +5430,15 @@ def make_handler(svc: Service):
                         return
                     self._json(200, out)
                     return
-                if path == "/api/update":
-                    self._update()
-                    return
-                if path == "/api/turbo":
-                    self._turbo()
-                    return
-                if path in ("/api/models/settings", "/api/models/switch", "/api/models/delete", "/api/models/leftovers"):
-                    self._models(path.rsplit("/", 1)[1])
-                    return
-                if path == "/api/savings/reset":
-                    # it clears every model's count: the app's own page only
-                    self._body()
-                    if not self._own_page("the savings can be reset"):
-                        return
-                    if svc.savings is None:
-                        self._json(400, {"error": {"type": "invalid_request_error", "message": "nothing is counted here"}})
-                        return
-                    svc.savings.reset()
-                    self._json(200, svc.savings.report())
-                    return
-                if path == "/api/savings/prices":
-                    # Settings > Savings: a model's API prices ({"model", "price": {input, cached, output} or null:
-                    # the built-in ones}); every total is counted again with them - the app's own page only
-                    body = self._body()
-                    if not self._own_page("the prices can be changed"):
-                        return
-                    try:
-                        req = json.loads(body or b"{}")
-                        if svc.savings is None:
-                            raise ValueError("nothing is counted here")
-                        if not isinstance(req, dict):
-                            raise ValueError("the request body must be a JSON object")
-                        svc.savings.set_price(req.get("model"), req.get("price"))
-                    except (TypeError, ValueError) as e:
-                        self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-                        return
-                    self._json(200, svc.savings.report())
-                    return
                 raw_ = self._body()
                 turn_mark("body")
+                if path not in ("/tokenize", "/detokenize", "/v1/chat/completions", "/v1/responses", "/v1/messages"):
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
                 req = json.loads(raw_ or b"{}")
                 turn_mark("json")
                 if not isinstance(req, dict):
                     raise ValueError("the request body must be a JSON object")
-                if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
-                    self._json(200, svc.count_tokens(req))
-                    return
                 if path == "/tokenize":                      # llama.cpp's and vLLM's: a text's or a prompt's ids
                     self._json(200, svc.tokenize(req))
                     return
@@ -6654,8 +5462,7 @@ def make_handler(svc: Service):
                     # scanned PDF's pages as pictures, before anything reads the messages (serve/attach.py)
                     attach.expand_request(req, {"/v1/responses": "responses", "/v1/messages": "anthropic"}.get(
                         path, "openai"), want_images=svc.vision is not None,
-                        text_limit=text_file_limit(svc.engine.max_context),
-                        **({"text_only": svc.text_only()} if svc.text_only() else {}))   # (GLM-5.3's words)
+                        text_limit=text_file_limit(svc.engine.max_context))
                 if path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/responses":
@@ -6722,7 +5529,7 @@ def make_handler(svc: Service):
                 return False
             origin = self.headers.get("Origin")
             if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
-                self._json(403, {"error": {"message": f"{what} only from Maya's own page"}})
+                self._json(403, {"error": {"message": f"{what} only from the server's origin"}})
                 return False
             return True
 
@@ -6739,115 +5546,6 @@ def make_handler(svc: Service):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
             self._json(202, {"reload": reload})
-
-        def _port(self):
-            # It moves the server for every client, so only the app's own page may ask for it
-            body = self._body()
-            if not self._own_page("the port can be changed"):
-                return
-            try:
-                req = json.loads(body or b"{}")
-                n = int(req.get("port")) if isinstance(req, dict) else 0
-                out = svc.set_port(n)
-            except (TypeError, ValueError, OSError) as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-                return
-            self._json(202, out)
-
-        def _models(self, what: str):
-            # They change which model runs, or how, for every client: only the app's own page
-            body = self._body()
-            if not self._own_page("models can be changed"):
-                return
-            try:
-                req = json.loads(body or b"{}")
-                if not isinstance(req, dict):
-                    raise ValueError("the request body must be a JSON object")
-                if what == "switch":
-                    out = svc.switch_model(req.get("file"))
-                elif what == "delete":
-                    out = svc.delete_model(req.get("file"), bool(req.get("files")), bool(req.get("dry_run")),
-                                           req.get("then"))
-                elif what == "leftovers":
-                    out = svc.delete_leftover(req.get("path"))
-                else:
-                    out = svc.model_settings(req.get("file"), req.get("settings") or {}, bool(req.get("dry_run")))
-            except (TypeError, ValueError, OSError) as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-                return
-            self._json(200 if what in ("delete", "leftovers") and not out.get("deleting")
-                       or (what == "settings" and req.get("dry_run")) else 202, out)
-
-        def _turbo(self):
-            # It changes the engine's settings (and restarts it) for every client: only the app's own page
-            body = self._body()
-            if not self._own_page("Turbo can be switched"):
-                return
-            try:
-                req = json.loads(body or b"{}")
-                if not isinstance(req, dict) or not isinstance(req.get("on"), bool):
-                    raise ValueError('send {"on": true} or {"on": false}')
-                out = svc.set_turbo(req["on"])
-            except (TypeError, ValueError, OSError) as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-                return
-            self._json(202 if out.get("restarting_now") else 200, out)
-
-        def _update(self):
-            # It replaces the server's files and restarts it for every client: only the app's own page
-            self._body()
-            if not self._own_page("an update can be started"):
-                return
-            try:
-                state = svc.updater.start(svc)
-            except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-                return
-            self._json(202, {"update": state})
-
-        def _settings(self):
-            # They change what every client gets, so only the app's own page may set them
-            body = self._body()
-            if not self._own_page("settings can be changed"):
-                return
-            try:
-                req = json.loads(body or b"{}")
-                shared = svc.set_shared(req.get("defaults") if isinstance(req, dict) else None)
-            except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-                return
-            print("[maya] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
-                  if shared else "[maya] other apps use their own settings again", flush=True)
-            self._json(200, {"shared": bool(shared), "defaults": shared})
-
-        def _attach(self):
-            """POST /attach (and /pdf, its first name): a file the chat page attached that the browser cannot read
-            itself, as its raw bytes, its name in X-File-Name (percent-encoded) - back as text (PDF, Word, Excel,
-            PowerPoint, OpenDocument, EPUB, RTF, text in any common encoding), as a scanned PDF's pages in pictures
-            when the model reads pictures, or as the error the page shows (serve/attach.py, #837).  The app's own
-            page only, like the other dashboard routes: the API key answers it as everywhere, and where _own_page
-            asks for application/json this asks for application/octet-stream (or application/pdf) - a form can
-            carry neither, which is what the check is for."""
-            raw = self._body()      # (read first even when refused: an unread body resets the answer on Windows)
-            ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
-            if ctype not in ("application/octet-stream", "application/pdf"):
-                self._json(415, {"error": {"message": "send the file's bytes as application/octet-stream"}})
-                return
-            origin = self.headers.get("Origin")
-            if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
-                self._json(403, {"error": {"message": "files are read only for Maya's own page"}})
-                return
-            if len(raw) > attach.MAX_BYTES:
-                self._json(413, {"error": {"message": f"the file is over the {attach.MAX_BYTES >> 20} MB a chat "
-                                                      "attachment can be"}})
-                return
-            name = unquote(self.headers.get("X-File-Name", "") or "")[:255] or ("file.pdf" if ctype ==
-                                                                                 "application/pdf" else "file")
-            # the same text-file cap health advertises (the page's own limit), and the same images flag: a model
-            # without vision gets a clear error instead of pictures its request would drop
-            self._json(200, attach.extract(name, raw, want_images=svc.vision is not None,
-                                           text_limit=text_file_limit(svc.engine.max_context),
-                                           **({"text_only": svc.text_only()} if svc.text_only() else {})))
 
         def _sse(self):
             # token frames are small and flushed as they come; Nagle would otherwise hold one
@@ -6958,7 +5656,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
-            req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
+            req["_api"] = "openai"
             svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
             messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
@@ -6981,23 +5679,13 @@ def make_handler(svc: Service):
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
-                watch_client(self, cancel)
+            watch_client(self, cancel)
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
             if not req.get("stream"):
                 return self._json(200, openai_collect(with_partial(chunks, openai_texts),
                                                       logprobs=logprobs_asked(req) is not None))
-            if req.get("strata_resume") is True:
-                # the web app: the answer runs on if the connection drops; the page reconnects to it by id
-                first = next(chunks)
-                job = StreamJob(first["id"], itertools.chain(
-                    [first], carry_embeddings(svc.embeddings, getattr(svc.embeddings, "path", None), chunks)), cancel)
-                jobs_put(job)
-                self._sse()
-                self._stream_job(job, 0)
-                return
             self._sse()
             try:
                 for c in chunks:
@@ -7016,54 +5704,6 @@ def make_handler(svc: Service):
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
-
-        def _stream_job(self, job: StreamJob, n: int):
-            """A StreamJob's chunks from index n as SSE until it completes; a reader that goes away leaves it running."""
-            job.reader(True)
-            try:
-                while True:
-                    items, done = job.wait(n, 10.0)
-                    if not items and not done:
-                        self.wfile.write(b": keep-alive\n\n")
-                    for c in items:
-                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
-                    n += len(items)
-                    self.wfile.flush()
-                    if done and n >= len(job.items):
-                        self.wfile.write(b"data: [DONE]\n\n")
-                        self.wfile.flush()
-                        return
-            except OSError:
-                return
-            finally:
-                job.reader(False)
-
-        def _job_get(self):
-            q = parse_qs(urlsplit(self.path).query)
-            job = JOBS.get(q.get("id", [""])[0])
-            if job is None:
-                self._json(404, {"error": {"message": "no such answer (finished more than a day ago, or the server "
-                                                      "restarted since)"}})
-                return
-            try:
-                start = max(0, int(q.get("from", ["0"])[0]))
-            except ValueError:
-                start = 0
-            self._sse()
-            self._stream_job(job, start)
-
-        def _job_cancel(self):
-            body = self._body()
-            if not self._own_page("answers can be stopped"):
-                return
-            try:
-                jid = (json.loads(body or b"{}") or {}).get("id", "")
-            except ValueError:
-                jid = ""
-            job = JOBS.get(jid)
-            if job is not None:
-                job.cancel.set()
-            self._json(200, {"cancelled": job is not None})
 
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
@@ -7131,7 +5771,7 @@ class Server(ThreadingHTTPServer):
 SERVER_ENV = ("MAYA_ENGINE_STALL_S", "MAYA_REQUEST_QUIET_S", "MAYA_DRAIN_S", "MAYA_HTTP_BACKLOG",
               "MAYA_MAX_BODY_MIB", "MAYA_FAIR_SLICE_S", "MAYA_DS4_KEEP_THINKING",
               "MAYA_SERVER_LOG", "MAYA_GLM_THINK_RESERVE", "MAYA_LOOP_GUARD", "MAYA_QUEUE_PING_S",
-              "MAYA_UPDATE_CHECK", "MAYA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
+              "MAYA_UPDATE_CHECK") + RESPONSE_ENV_KEYS + \
     tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
 
 
@@ -7191,7 +5831,6 @@ def lan_addresses() -> list[str]:
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
-    svc.listen = (host, httpd.server_address[1])         # (the dashboard's Port setting starts from it)
     httpd.response_service = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
@@ -7248,21 +5887,9 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
-def chat_template_path(tpath) -> Path:
-    """The template a model renders with (main): its tokenizer's chat_template.jinja (the pack's copy: MiniMax's and
-    DeepSeek's are tools/mm3's and tools/ds4's - DeepSeek's rendered by its pinned encoder, serve/ds41_encoding.py -
-    CYBER-FROST's its own, verbatim), a GLM-5 pack's swapped for serve/glm5_chat_template.jinja (MAYA_PACK_TEMPLATE=1
-    keeps the pack's), and serve/chat_template.jinja when the tokenizer has none."""
-    tpl = Path(tpath) / "chat_template.jinja"
-    tpl = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
-    glm5 = ROOT / "serve/glm5_chat_template.jinja"
-    if glm_dsa_product.pack_is_glm_dsa(Path(tpath).parent):   # GLM-5.3 (glm-dsa): its own template, never Flash's
-        return tpl if tpl.exists() and tpl.parent == Path(tpath) else glm_dsa_product.TEMPLATE
-    if glm5.exists() and os.environ.get("MAYA_PACK_TEMPLATE") != "1" and tpl != glm5:
-        head = tpl.read_text(encoding="utf-8", errors="replace")
-        if head.startswith("[gMASK]<sop>") and "reasoning_effort in ['low', 'high']" in head:
-            tpl = glm5
-    return tpl
+def chat_template_path(tpath: Path) -> Path:
+    template = tpath / "chat_template.jinja"
+    return template if template.is_file() else ROOT / "serve/chat_template.jinja"
 
 
 def checked_config_effort(cfg: dict, template, maya: bool) -> dict:
@@ -7271,23 +5898,13 @@ def checked_config_effort(cfg: dict, template, maya: bool) -> dict:
     42 of 100 (#768).  A bad value stops the start at once (SystemExit), a number meant as tokens pointed to
     thinking_budget."""
     if "reasoning_effort" not in cfg and maya:          # (a config without one: the model's own level)
-        cfg = dict(cfg, reasoning_effort=maya_quants.model_defaults(cfg)[1])
+        cfg = dict(cfg, reasoning_effort="auto")
     if cfg.get("reasoning_effort") or (template.deepseek and cfg.get("reasoning_effort") is not None):
         try:
             cfg = dict(cfg, reasoning_effort=config_effort(cfg["reasoning_effort"], template.deepseek))
         except ValueError as e:
             raise SystemExit(f"[maya] config reasoning_effort: {e}")
     return cfg
-
-
-def think_budget_at_max(template, cfg: dict, budget: int) -> int:
-    """GLM-5.3 (glm-dsa, its template's flag): the most a request that asks for Max itself may think while `budget` is
-    the run config's default (maya_quants.GLM53_MAX_THINK_BUDGET: 65536; the owner, 2026-11-07) - the server's
-    Service.think_budget_max (run: as far as the request's room allows).  0 (the same budget at every level) for a
-    budget the user set, for no budget, and for every other model."""
-    if getattr(template, "glm_dsa", False) and budget > 0 and maya_quants.thinking_budget_is_default(cfg):
-        return maya_quants.GLM53_MAX_THINK_BUDGET
-    return 0
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
@@ -7506,23 +6123,21 @@ def tee_server_log(path: str) -> None:
     sys.stdout = ServerLogTee(sys.stdout, handle)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    maya_names.alias_env(os.environ)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "maya", "strata"], default="mock")   # (strata: the old name, kept for older scripts)
-    ap.add_argument("--config", help="maya engine config (JSON: exe, args, cwd, tokenizer, model_name), "
-                                     "written by setup.py")
+    ap.add_argument("--config", help="engine config JSON (exe, args, cwd, tokenizer, model_name)")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
-    ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--port", type=int, help="listen port (also port in the config, default 8095)")
     ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
                                   "(\"0,2\"; also \"gpu\" in the config)")
-    ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
-                    help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
-    ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
+    ap.add_argument("--tokenizer", help="tokenizer directory (required for the native engine if absent from config)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help='unload the model after this many seconds without requests, so other programs can use the GPU '
                          'memory and the RAM; the next request loads it again (also "idle_unload_s" in the config; '
@@ -7531,21 +6146,24 @@ def main() -> int:
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("MAYA_API_KEY", ""),
-                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); several separated by "
-                         "commas; also $MAYA_API_KEY")
+                    help="require API keys for generation and protected routes. Send Authorization: Bearer KEY "
+                         "or x-api-key. Separate keys with commas. Also TINTERO_API_KEY.")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
-                                         "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
+                                         "{...}}); clients can opt in with strata_mcp (also \"mcp_servers\" in "
                                          "the config)")
     ap.add_argument("--parent-pipe", action="store_true",
                     help="stdin is a pipe from the program that started this server (maya.py), open while it runs: "
                          "when it closes - that program ended, however it ended - the server stops as on Ctrl+C "
                          "(on Linux also when its parent process ends)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.engine == "strata":
         a.engine = "maya"
-    maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
     cfg = maya_names.env_in(json.loads(Path(a.config).read_text(encoding="utf-8-sig"))) if a.config else {}   # (a BOM: Notepad)
     apply_server_env(cfg)
+    if a.engine == "maya" and not cfg:
+        ap.error("--engine maya needs --config")
+    if a.port is None:
+        a.port = cfg.get("port", 8095)
     if not isinstance(sys.stdout, StampedStdout):       # (#783: a time before each [maya] line, in the log too)
         sys.stdout = StampedStdout(sys.stdout)
     # the server's own lines go to the run's log as well (the engine writes its stderr there): a run whose terminal
@@ -7570,40 +6188,23 @@ def main() -> int:
             os.environ[k_] = str(cfg["env"][maya_names.read_as(k_)])
     globals()["TURN_TRACE"] = os.environ.get("MAYA_TURN_TRACE", "") not in ("", "0")
     tok = ByteTokenizer()
-    tpath = Path(a.tokenizer)
-    if a.engine == "maya" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
-    if (tpath / "vocab.json").exists():
+    tpath = Path(a.tokenizer) if a.tokenizer else None
+    if a.engine == "maya" and (tpath is None or not (tpath / "vocab.json").is_file()):
+        ap.error("the model's tokenizer is missing; export it and set tokenizer in the config")
+    if tpath is not None and (tpath / "vocab.json").is_file():
         import strata_tokenizer as ST
-        tok = ST.Tokenizer.from_dir(tpath)              # with the pack's own pre-tokenizer (GLM: glm4, #27)
-    hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
-    # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
-    # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
-    # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
-    # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
-    # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.  Read before the load: it tells the model's family, by which
-    # the config's reasoning_effort is checked here, not after the minutes of loading (#807)
-    glm_dsa = glm_dsa_product.config_is_glm_dsa(cfg) or glm_dsa_product.pack_is_glm_dsa(tpath.parent)
-    template = ChatTemplate(chat_template_path(tpath), glm_dsa=glm_dsa)
-    if glm_dsa:
-        print(f"[maya] GLM-5.3 (glm-dsa), text only; chat template: {template.dialect.describe()}", flush=True)
+        tok = ST.Tokenizer.from_dir(tpath)
+    template = ChatTemplate(chat_template_path(tpath) if tpath is not None else ROOT / "serve/chat_template.jinja")
     cfg = checked_config_effort(cfg, template, a.engine == "maya")
-    two_gpus = False
+    hub = hub_from_config(cfg, a.mcp_config)
     if a.engine == "maya":
-        if not cfg:
-            ap.error("--engine maya needs --config")
-        # GLM on an AMD APU with an NVIDIA card beside it ("mixed_gpus": true): the card leads, the APU helps
-        # (serve/glm_link.py; a config without the key starts as before)
-        cfg, link_line = glm_link.at_start(cfg)
-        if link_line:
-            print(link_line, flush=True)
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if "sampling" not in cfg:                       # (a config without them: the model's own, not none)
-            sampling_defaults = maya_quants.model_defaults(cfg)[0]
-        if models.ablate_default(cfg):                  # (refusal ablation on by default: the Models page's switch)
-            sampling_defaults = {**(sampling_defaults or {}), "ablate": True}
+            sampling_defaults = {"temperature": 1.0, "top_p": 1.0}
+        if isinstance(cfg.get("ablate"), dict) and cfg["ablate"].get("default") is True:
+            sampling_defaults = {**sampling_defaults, "ablate": True}
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[maya] sampling defaults from the {'config' if 'sampling' in cfg else 'model'}: {pretty}",
@@ -7613,99 +6214,31 @@ def main() -> int:
         venv = dict(env)
         if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
             venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
-        # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
-        # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
-        # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
-        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
-        engine_env = env
-        if on_demand:
-            fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
-                                  (gpu_list(cfg) or [0])[0])
-            if fp is None:
-                print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
-                      flush=True)
-                vcfg, on_demand = dict(vcfg, gpu=False), False
-            else:
-                vcfg = dict(vcfg, max_tokens=fp[0])
-                engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
-                print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
-                      "image tokens", flush=True)
-        if vcfg and not on_demand:
+        if vcfg:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(vcfg, log=vlog, env=venv)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
-        mixed = mixed_gpus.config_of(cfg)   # (opt-in: an NVIDIA card beside the AMD GPU runs the first layers)
-        if mixed is not None:
-            engine = mixed_gpus.engine_class(StrataEngine, wait_gpu_release)(
-                cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env, mixed=mixed)
-        else:
-            # (Hy4-Flash under Windows, a card whose CUDA share is not measured yet for this PC and driver: the engine
-            #  says at this start how much less free VRAM its choices hold with - the setup and the Models page count
-            #  the figure from then on; the start itself is the same)
-            room_card = models.hy4_room_due(cfg)
-            eargs = engine_args(cfg) + (["--room-report"] if room_card else [])
-            engine = StrataEngine(cfg["exe"], eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
-            if room_card:
-                exe_, args_, *rest = engine.spawn             # (a start again: as without the flag)
-                engine.spawn = (exe_, [x for x in args_ if x != "--room-report"], *rest)
-                models.hy4_room_measured(cfg, room_card, engine.info)
-        engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
-        two_gpus = bool(getattr(engine, "mixed_on", False))   # (DeepSeek on both GPUs: serve/mixed_gpus.py)
+        exe = cfg["exe"]
+        if os.name == "nt":
+            path = Path(cfg.get("cwd") or ".") / exe
+            if not path.suffix and path.with_suffix(".exe").is_file():
+                path = path.with_suffix(".exe")
+            if path.is_file():
+                exe = str(path.resolve())
+        engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        engine.load_s = round(time.time() - t0, 1)
         warn_tight_ram(engine.info.get("arena_mib"))
-        if vision is None and not vcfg and engine.info.get("vision") == "ds4":
-            # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
-            vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-ds4-pictures-")), Vision.load)
-            room = engine.info.get("vision_room")
-            where = (f"{engine.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
-                     f"none between pictures, ~{engine.info.get('vision_room_mib')} MiB while one is read, lent by "
-                     + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
-            print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}: "
-                  f"{where}), up to {vision.g.max_tokens} tokens a picture", flush=True)
-        elif vision is None and not vcfg and engine.info.get("vision") == "hy4":
-            # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
-            vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-hy4-pictures-")), Vision.load)
-            # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
-            where = (f"; no VRAM kept for pictures (~{engine.info.get('vision_room_mib')} MiB while one is read, lent "
-                     "by the prompt buffers)" if engine.info.get("vision_room") == "chunk" else "")
-            print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
-                  f"({vision.g.max_tokens} tokens for a square one) a picture{where}", flush=True)
-        elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
-            # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
-            vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-mm3-pictures-")), Vision.load)
-            print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
-                  f"({vision.g.max_tokens} tokens) a picture", flush=True)
-        elif vision is None and not vcfg and engine.info.get("vision") == "off":
-            # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
-            print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
-                  flush=True)
-        if on_demand:
-            lent = int(engine.info.get("vision_lend") or 0)
-            if lent > 0:
-                vision = Vision(vcfg, log=vlog, env=venv, start=False)
-                vision.lend = lambda: engine.command("VLEND", "VLENT")
-                vision.reclaim = lambda: engine.command("VRECLAIM", "VRECLAIMED")
-                print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
-                      "the model lends it", flush=True)
-            else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
-                print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
-                      "runs on the CPU", flush=True)
-                vision = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."],
             tok_s=float(os.environ.get("MAYA_MOCK_TOK_S") or 0) or None), None, {}
     svc = Service(engine, tok, template,
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                  model_name=cfg.get("model_name", "inkling-2-mini" if a.engine == "maya" else "mock"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
-    if cfg:   # (refusal ablation's reason when the model cannot have it: Qwen, the Mac engine - "not available")
-        svc.ablate_why = models.ablate_choice(cfg).get("why") or ""
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)
         print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
@@ -7726,16 +6259,10 @@ def main() -> int:
     if svc.native_inkling_guard:
         svc.think_budget = int(cfg.get("thinking_budget") or 0)
     elif svc.think_end_id is not None:
-        default_budget = maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768
-        svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else default_budget)
+        svc.think_budget = int(cfg.get("thinking_budget", 32768) or 0)
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
-    # GLM-5.3 (glm-dsa): a request that asks for Max itself may think up to 65536 tokens while the budget is the
-    # default (the owner, 2026-11-07); a budget the user set applies at every level (Service.think_budget_max)
-    svc.think_budget_max = think_budget_at_max(svc.template, cfg, svc.think_budget)
     if svc.think_budget:
-        at_max = f", up to {svc.think_budget_max} when a request asks for Max" \
-            if svc.think_budget_max > svc.think_budget else ""
-        print(f"[maya] thinking budget: {svc.think_budget} tokens{at_max} (then the answer)", flush=True)
+        print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
     svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
     if svc.model_management:
         print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
@@ -7755,41 +6282,16 @@ def main() -> int:
     if cfg.get("backend") == "hip":                      # (Windows: the Monitor finds the engine's cards with its hipInfo)
         from serve import telemetry
         telemetry.HIP_BIN_DIRS = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
-    svc.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
-    if (cfg.get("mixed_gpus_active") or two_gpus) and svc.model_label:   # (the dashboard shows it: both GPUs on)
-        svc.model_label += " · AMD + NVIDIA"
     if a.config:
-        svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
-        p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
-        svc.savings = savings.Ledger(savings.ledger_path(p), p.name, svc.model, models.quant_label(cfg, p))
-        threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
-        kept = jobs_load(p.parent / "answers")          # the web chat's answers of the last day survive a restart
-        if kept:
-            print(f"[maya] {kept} web-chat answer(s) of the last day kept for the page (answers/)", flush=True)
-    args = [str(x) for x in cfg.get("args") or []]
-    flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
-    if flag:                                            # the model's folder: the parent of the pack or GGUF file
-        svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
-        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
-                         daemon=True).start()
-    elif getattr(engine, "info", {}).get("engine_kind") == "ik2" and "--model" in args[:-1]:
-        gguf = Path(cfg.get("cwd") or ".") / engine.model_path
+        svc.config_path = str(Path(a.config).resolve())
+    args = cfg.get("args") or []
+    if a.engine == "maya" and "--model" in args[:-1]:
+        gguf = Path(cfg.get("cwd") or ".") / args[args.index("--model") + 1]
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(gguf)), daemon=True).start()
-    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
-        svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
-        svc.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent
-        # (DeepSeek's engine drafts unless --dspark off / none - "none" does not even load the blocks - when the pack
-        #  has them; MiniMax's says so itself, INFO dspark=)
-        if models.family(cfg) == "deepseek":
-            svc.dspark = models.flag(args, "--dspark", "on") not in ("off", "none") and models.ds4_has_drafter(cfg)
-            try:
-                svc.lookup = int(models.flag(args, "--suffix-draft", "3")) > 0
-            except ValueError:
-                svc.lookup = True
     if a.config:                                        # the Chat settings shared with other apps, from last time
-        svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
+        shared_path = Path(a.config).with_suffix(".shared-settings.json")
         try:
-            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
+            svc.shared = clean_shared_defaults(json.loads(shared_path.read_text(encoding="utf-8")))
             if svc.shared:
                 print("[maya] other apps use the Chat settings: " +
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
@@ -7798,35 +6300,32 @@ def main() -> int:
     if hub is not None:
         import atexit
         svc.mcp = hub
-        print(f"[maya] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
-              f"chat: {', '.join(hub.servers)}", flush=True)
+        print(f"[maya] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for requests that opt in: "
+              f"{', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
+    a.port = httpd.server_port
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, /v1/responses, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
-            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
+            print(f"       from other devices: http://{ip}:{a.port}/v1", flush=True)
         if not ips:
-            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
+            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/v1", flush=True)
         if not svc.api_key:
             print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
-                  "to the config (clients send it as their API key; the web page asks for it)", flush=True)
+                  "to the config (clients send it as their API key)", flush=True)
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or run "
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Maya " + str(a.port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
-    if a.open:
-        import webbrowser
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
     # SIGTERM (llama-swap's cmdStop, systemd), SIGHUP (the terminal closed), Ctrl+C, Windows' Ctrl+Break and - with
     # --parent-pipe - the end of maya.py (watch_parent) end the server alike: the engine gets QUIT and time to keep its
     # conversation.  A second signal while that runs (systemd signals the whole group, then the supervisor again) is

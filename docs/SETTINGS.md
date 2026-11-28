@@ -2,6 +2,65 @@
 
 The [gfx1100 preset](inkling2-mini/ik2-mini-gfx1100.json) supplies the Radeon defaults. See the [HIP guide](HIP-PORT.md) for slot counts, memory use and tested cache sizes.
 
+## Environment and build settings
+
+Use the `TINTERO_*` names below for new configurations. The corresponding
+`MAYA_*` spellings remain available. When both spellings appear in the same
+source, Tintero uses `TINTERO_*`, even if its value is empty. Existing
+`STRATA_*` fallbacks for Python and CMake come after both. Empty values keep
+the setting's existing behavior. For example, an empty API key falls through
+to the top-level `api_key` in the run config, and an empty gfx1100 preset
+override selects the automatic preset.
+
+Export the server settings before running `python -m serve.server`. Settings
+marked **yes** in the JSON column can also go in the run config's `env` object.
+A non-null entry there takes precedence over the inherited environment for
+that setting, including when the two sources use different spellings.
+`--api-key` can override the inherited API key.
+
+| Setting | JSON | Default | Effect |
+| --- | --- | --- | --- |
+| `TINTERO_API_KEY` | | Empty | Requires one of these comma-separated API keys. |
+| `TINTERO_MODEL_MANAGEMENT` | | On | Enables the load, unload and model event API. Falls back to the top-level `model_management` setting if empty or unset. |
+| `TINTERO_HTTP_BACKLOG` | Yes | 256 | Pending socket connections, with a minimum of 5. |
+| `TINTERO_MAX_BODY_MIB` | Yes | 256 | Maximum HTTP request body size in MiB. |
+| `TINTERO_REQUEST_TIMEOUT_S` | | 300 | Timeout in seconds for a socket read or write. |
+| `TINTERO_QUEUE_PING_S` | Yes | 2 | Seconds between streaming keep-alives while a request is queued. |
+| `TINTERO_FAIR_SLICE_S` | Yes | 0 | Seconds of decoding before yielding to another queued request where the engine supports it. Zero disables slicing. |
+| `TINTERO_ENGINE_STALL_S` | Yes | 90 | Seconds of inactivity before the stall watchdog can end an engine. Zero disables it. |
+| `TINTERO_REQUEST_QUIET_S` | Yes | 900 | Seconds without an engine event for a request before timing it out. Zero disables the timeout. |
+| `TINTERO_DRAIN_S` | Yes | 60 | Seconds to wait for a cancelled request to drain where the engine supports it. |
+| `TINTERO_ENGINE_QUIT_S` | | 50 | Seconds to wait for the engine to exit after sending QUIT. |
+| `TINTERO_ENGINE_WRAP_S` | | 40 | Seconds to let an active request finish on shutdown where the engine supports it. Zero or empty skips the wait. |
+| `TINTERO_LOOP_GUARD` | Yes | On | Controls the server's repetition detection. See [the loop guard](#the-loop-guard). |
+| `TINTERO_LOOP_GUARD_COLLAPSE_MAX` | | 32000 | Character threshold for repeated message collapse. Zero removes the limit. |
+| `TINTERO_PROMPT_MEMO` | Yes | On | Reuses tokenization work for repeated parts of prompts. Set to `0` to disable it. |
+| `TINTERO_SERVER_LOG` | Yes | The run config's `log` path, if present | Mirrors server output to this file. Empty or `0` keeps output on the terminal. |
+| `TINTERO_UPDATE_CHECK` | Yes | On | Set to `0` to disable release lookups from `GET /api/update`. |
+| `TINTERO_GLM_RESPONSES_*` | Yes | [Responses limits](RESPONSES.md#settings-and-metrics) | Sets storage, job and event retention limits for `/v1/responses`. The `GLM` part of the name is historical. |
+
+`TINTERO_CONFIG`, `TINTERO_MODEL`, `TINTERO_HOST` and `TINTERO_PORT` are
+[container settings](PRESETS.md#run-a-preset) already using the Tintero prefix.
+The standalone gfx1100 package accepts `TINTERO_IK2_PRESET` in its shell
+launcher or Compose `.env`. Its older `MAYA_IK2_PRESET` name also works.
+
+CMake accepts `-DTINTERO_ENABLE_HIP=ON`, `-DTINTERO_ENABLE_CUDA=ON` and
+`-DTINTERO_BUILD_TESTS=ON`. Both GPU backends default to off and the test option
+defaults to `BUILD_TESTING`. The `MAYA_*` and `STRATA_*` equivalents still work.
+`IK2_*` names in the [Inkling engine settings](#inkling-2-small) keep their names.
+
+The `MAYA_MOCK_*`, `MAYA_TEST_*`, `MAYA_DEBUG`, `MAYA_TURN_TRACE` and
+`MAYA_PULL_COMMAND` variables are test or developer controls.
+`MAYA_RESTART_ON_UPDATE` is the installer's supervision signal.
+Legacy model tuning and packing variables, including `MAYA_DS4_*`,
+`MAYA_GLM_*` outside the Responses limits, and `MAYA_PACK_*`, keep their
+existing spellings where the legacy code still reads them. `MAYA_PAR_MAX`
+caps the legacy `--parallel` flag. Inkling uses `--cache-slots`.
+`MAYA_VIDEO_MAX_FRAMES` belongs to the legacy external vision path.
+Removed native engine settings in the changelog have no Tintero alias.
+`MAYA_VERSION` is read from the `VERSION` file, and `MAYA_TOKENIZER` occurs
+only in tests.
+
 ## When the engine stops an answer
 
 An answer ends with `finish_reason` "length" (Anthropic: `stop_reason` "max_tokens"; Responses: status "incomplete"
@@ -14,15 +73,13 @@ with that API's own error instead, never with a finish reason a client would tak
 | OpenAI chat completions | the text already sent stands; then a `data: {"error": {"type": "server_error", ...}}` chunk and `data: [DONE]` (no `finish_reason` chunk) | HTTP 422, `{"error": {"type": "engine_error", "code": "engine_error", "message": ..., "partial_text": ...}}` |
 | Anthropic messages | the text already sent stands; then `event: error` (`api_error`), no `message_delta` with a `stop_reason` | HTTP 422, `{"type": "error", "error": {"type": "engine_error", "message": ..., "partial_text": ...}}` |
 | Responses | `response.failed` with `error.code` "server_error" | HTTP 422, the response with status "failed", `error.code` "engine_error" and `error.partial_text` |
-| Maya's model API (`/api/chat`, `/api/generate`) | a last line `{"error": ...}`, no `done: true` line | HTTP 422 with `{"error": ..., "error_type": "engine_error", "partial_text": ...}` |
 
 The documented finish reasons have no "error" value (OpenAI's are stop / length / tool_calls / content_filter /
 function_call, Anthropic's end_turn / max_tokens / stop_sequence / tool_use / pause_turn / refusal), so a new one
 would be read as a normal end by some clients; the error forms above are the ones every client handles (the OpenAI and
 Anthropic SDKs raise an error on them). A request that is not streamed gets 422, not a 5xx: the SDKs send a 5xx,
 408, 409 or 429 again by themselves, which would run the same long answer once more without the client seeing the
-error. Its error carries what the answer had written before it: `partial_text` (and `partial_reasoning` - Maya's
-model API: `partial_thinking` - when it was still thinking), less the last few tokens the loop guard still held
+error. Its error carries what the answer had written before it: `partial_text` and `partial_reasoning` when it was still thinking, less the last few tokens the loop guard still held
 back. The message says how many tokens the answer had and why it stopped: after a GPU's fault on DeepSeek, the call
 that failed and the position in the context (what the engine prints on the console as it ends); otherwise that the
 reason is in the engine's log. After a GPU's fault the engine ends, and the next request starts a fresh one.
@@ -33,18 +90,17 @@ Two config settings shape the thinking, and only one of them counts tokens:
 
 | Setting | What it is |
 |---|---|
-| `"thinking_budget"` | the cap on the thinking, in tokens (32768 by default; 8192 for GLM-5.3-Flash Maya-XS; 0 = none). Past it the server closes the thinking at the next sentence or line end and the answer starts. Settings > Chat defaults > Thinking budget changes it without a restart. GLM-5.3 (744B): a request that asks for Max itself gets up to 65536, as far as its room keeps 32768 for the answer, while the budget is the default (none set, or 32768); another value, or any value saved on the dashboard, applies at every level |
-| `"reasoning_effort"` | the thinking level a request gets when it names none: a word (`none`, `auto`, `low`, `medium`, `high`, `xhigh`, `max`). DeepSeek-V4.1 also takes a number from 1 to 100 (`42` or `"42"`), its own effort level: it is written into the prompt as a hint to the model, not a token cap |
+| `"thinking_budget"` | The token cap for reasoning. Inkling-2-Mini defaults to 0, which leaves reasoning uncapped. |
+| `"reasoning_effort"` | The thinking level when a request leaves it out. Inkling accepts `none`, `auto`, `low`, `medium`, `high`, `xhigh` and `max`. |
 
-Inkling-2-Mini has no thinking cap by default. Set `thinking_budget` in the preset, on the dashboard,
-or in the request body (including SDK `extra_body`). Chat Completions, Responses and Messages accept
-a per-request override. Zero disables the cap for that request. Inkling counts reasoning tokens
+Set `thinking_budget` in the preset or POST a JSON body such as `{"budget":2048}` to `/api/thinking-budget`.
+Chat Completions, Responses and Messages also accept a per-request override. Zero disables the cap for that request.
+Inkling counts reasoning tokens
 and opens an answer segment at the cap. If the output limit binds first, the server reserves
 a quarter of it (up to 1024 tokens) for the answer. Inkling reads the cap from the top-level JSON setting, outside `env`.
 Anthropic's `thinking.budget_tokens` selects an effort level. The hard cap uses `thinking_budget`.
 
-A `reasoning_effort` the model does not take (a number above 100 for DeepSeek, any number for the other models) stops
-the start before the model loads, with a message that points to `thinking_budget`.
+An invalid `reasoning_effort` in the preset stops startup before the model loads.
 
 ## The loop guard
 
@@ -113,12 +169,12 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   ends it, and so does the engine's EOS token there (a call cut off by it is incomplete, not failed).
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
-token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,
+token 1,763: repeats dropped, a short repetition penalty`); `/metrics` marks that request (Loop guard,
 on hover what it did) and counts the loops since the start, as do `/metrics` (`loop_guard`) and
 `/metrics/prometheus` (`maya:loop_guard_*_total`; the notes across turns: `[maya] loop guard: `bash` 3 times with the
 same arguments and result: a note after it`, `maya:loop_guard_tool_repeats_total`).
 
-Off for the server: `MAYA_LOOP_GUARD=0`, or `"loop_guard": false` in the run config. A request can choose for itself
+Off for the server: `TINTERO_LOOP_GUARD=0`, or `"loop_guard": false` in the run config. A request can choose for itself
 with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completions, Anthropic Messages).
 
 ## Inkling-2-Small
@@ -127,8 +183,8 @@ thinkingmachines' [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkl
 its own engine, `tintero` (`src/ik2`; CUDA on Linux, Ampere on), from unsloth's GGUFs
 ([unsloth/Inkling-2-Small-GGUF](https://huggingface.co/unsloth/Inkling-2-Small-GGUF): UD-Q4_K_XL, UD-Q3_K_XL) read in
 place. The routed experts sit in pinned host memory (~323 GiB for UD-Q4_K_XL, ~260 GiB for UD-Q3_K_XL) with a cache of
-them in VRAM; one request at a time, text only. `maya.py` does not set it up yet: docs/INKLING2.md section 6 has the
-tokenizer folder and the run config, then `python serve/server.py --engine maya --config ik2.json`.
+them in VRAM. It serves one text request at a time. See [Inkling-2-Small](INKLING2.md#6-phase-2-the-engine-tintero) for the
+tokenizer and run config.
 
 **Defaults**: temperature 1.0, top-p 1.0 (its card and files name none); the thinking level Auto, the template's own
 (0.9 - "high"). The template is thinkingmachines' (`tools/ik2/chat_template.jinja`), which takes every level by name:

@@ -1,7 +1,8 @@
-"""The dashboard's About > Updates: is a newer Project Maya release out, and updating this folder to it.
+"""The dashboard's About > Updates: is a newer Tintero release out, and updating this folder to it.
 
 The check asks GitHub for the latest release of the repository this folder was cloned from (git's origin; else
-mw00/project-maya) - only when the dashboard asks, at most every six hours (MAYA_UPDATE_CHECK=0 turns it off).
+GodGMN/tintero, which is what a Docker image or a release tarball has: no .git) - only when the dashboard asks, at
+most every six hours (TINTERO_UPDATE_CHECK=0 or MAYA_UPDATE_CHECK=0 turns it off).
 Updating fast-forwards the git checkout to that release's tag, then the server ends with UPDATE_EXIT: maya.sh /
 START-MAYA.bat (maya.py) start Maya again, which compiles what changed in the engine and loads the model.  A folder
 that can't do that (no git, local changes, a server started some other way) gets the reason and the steps by hand."""
@@ -15,7 +16,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO = "mw00/project-maya"
+REPO = "GodGMN/tintero"           # the releases of installs that are not a git checkout
+UPDATE_CHECK_ENV = ("TINTERO_UPDATE_CHECK", "MAYA_UPDATE_CHECK")   # the first one set decides; "0" turns the check off
 UPDATE_EXIT = 75                    # the server's exit code that tells maya.py: updated, start again (EX_TEMPFAIL)
 RESTART_EXIT = 76                   # ... the dashboard saved a new port: start again with the saved config
 SUPERVISED = "MAYA_RESTART_ON_UPDATE"   # set by maya.py for the server it starts: it starts it again after an update
@@ -72,7 +74,8 @@ class Updater:
 
     # ---------------------------------------------------------------- is there a newer release
     def enabled(self) -> bool:
-        return os.environ.get("MAYA_UPDATE_CHECK", "1") != "0"
+        value = next((os.environ[k] for k in UPDATE_CHECK_ENV if k in os.environ), "1")
+        return value.strip() != "0"
 
     def check(self, force: bool = False) -> dict:
         if self.enabled() and (force or time.time() >= self.next_check):
@@ -85,7 +88,7 @@ class Updater:
         repo = origin_repo(self.root) if (self.root / ".git").exists() else REPO
         req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
                                      headers={"Accept": "application/vnd.github+json",
-                                              "User-Agent": f"project-maya/{self.current or '?'}"})
+                                              "User-Agent": f"tintero/{self.current or '?'}"})
         try:
             with urllib.request.urlopen(req, timeout=8) as r:
                 rel = json.loads(r.read().decode("utf-8"))
@@ -154,7 +157,7 @@ class Updater:
 
     def _update(self, svc, tag: str):
         with svc.fifo:                                  # the request in flight finishes first
-            print(f"[maya] updating Project Maya to {tag} ...", flush=True)
+            print(f"[maya] updating Tintero to {tag} ...", flush=True)
             before = None
             try:
                 before = git(self.root, "rev-parse", "HEAD", timeout=20).stdout.strip()

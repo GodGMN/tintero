@@ -110,8 +110,7 @@ class Template(unittest.TestCase):
         self.assertFalse(t.minimax or t.deepseek or t.qwen or t.hy4 or t.glm_effort or t.glm_dsa)
 
     def test_other_templates_are_not(self):
-        for path in ("serve/chat_template.jinja", "serve/glm5_chat_template.jinja", "tools/mm3/chat_template.jinja",
-                     "serve/fixtures/hy4_flash/chat_template.jinja"):
+        for path in ("serve/chat_template.jinja", "serve/glm5_chat_template.jinja"):
             self.assertFalse(ChatTemplate(ROOT / path).inkling, path)
 
     def test_levels(self):
@@ -471,11 +470,6 @@ class Serving(unittest.TestCase):
 class Defaults(unittest.TestCase):
     CFG = {"exe": "/opt/maya/build/tintero", "args": ["--model", "/models/Inkling-2-Small-UD-Q3_K_XL-00001-of-00005.gguf",
                                                        "--max-context", "32768"], "model_name": "inkling-2-small"}
-
-    def test_models_own(self):
-        Q = server.maya_quants
-        self.assertEqual(Q.family_of(self.CFG), "ik2")
-        self.assertEqual(Q.model_defaults(self.CFG), ({"temperature": 1.0, "top_p": 1.0}, "auto"))
 
     def test_config_effort(self):
         cfg = server.checked_config_effort(dict(self.CFG), public(), True)

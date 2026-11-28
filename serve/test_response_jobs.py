@@ -10,10 +10,7 @@ import unittest
 
 from serve.response_jobs import BackgroundJobs
 from serve.response_store import ResponseStore
-from serve.test_responses import RecordingEngine, ResponseCase, ROOT, openai
-from serve import ds4_vision
-from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer
+from serve.test_responses import RecordingEngine, ResponseCase, openai
 from serve.test_server import LifecycleEngine
 
 
@@ -297,37 +294,6 @@ class BackgroundResponses(ResponseCase):
         self.assertNotIn("response.output_text.delta", [e[0] for e in events if e])
         self.assertEqual(self.svc.active, 0)
 
-    def test_background_image_preparation_and_generation_share_resource_ownership(self):
-        class Vision:
-            owed = False
-
-            def active(self):
-                return contextlib.nullcontext()
-
-            def encode(self, source):
-                self.thread = threading.get_ident()
-                path = self.dir / "encoded.sve"
-                path.write_bytes(b"image-embedding")
-                return path, 3
-
-        class Engine(RecordingEngine):
-            def generate(self, *args, **kwargs):
-                self.thread = threading.get_ident()
-                yield from super().generate(*args, **kwargs)
-
-        with tempfile.TemporaryDirectory() as directory:
-            vision = Vision()
-            vision.dir = Path(directory)
-            self.svc.vision = vision
-            self.engine = Engine(self.tok, "Image received")
-            self.svc.engine = self.engine
-            _, initial = self.post(background=True, store=True, input=[{"role": "user", "content": [
-                {"type": "input_image", "image_url": "data:image/png;base64,fixture"}]}])
-            self.assertEqual(self.wait(initial["id"])["status"], "completed")
-            self.assertEqual(vision.thread, self.engine.thread)
-            self.assertEqual(self.engine.image_bytes, b"image-embedding")
-            self.assertFalse(Path(self.engine.last_embeddings).exists())
-
     def test_stream_reader_admission_is_bounded_and_released(self):
         from serve.response_jobs import JobError
         self.configure(STREAM_READERS=1, STREAM_OWNER_READERS=1)
@@ -341,26 +307,27 @@ class BackgroundResponses(ResponseCase):
             self.assertEqual(manager.stats()["readers"], 1)
         self.assertEqual(manager.stats()["readers"], 0)
 
-    def test_ds4_images_reach_foreground_and_background_engines_and_are_cleaned(self):
-        class Tokenizer(ByteTokenizer):
-            SPECIALS = ByteTokenizer.SPECIALS + [ds4_vision.PLACEHOLDER]
-            special_tokens = {s: 256 + k for k, s in enumerate(SPECIALS)}
+    def test_image_embeddings_reach_foreground_and_background_engines(self):
+        data = struct.pack("<5i", 0x31455653, 2, 1, 1, 1) + b"\x00" * 8
 
-        class Vision(ds4_vision.Vision):
-            def picture(self, source):
+        class Encoder:
+            def __init__(self, directory):
+                self.dir = Path(directory)
+
+            def encode(self, source):
                 self.thread = threading.get_ident()
-                return ds4_vision.Picture(b"\x7f" * 12, 2, 2, 1, 1)
+                path = self.dir / "cached.sve"
+                path.write_bytes(data)
+                return path, 2
 
         class Engine(RecordingEngine):
             def generate(self, *args, **kwargs):
                 self.thread = threading.get_ident()
+                self.embeddings_path = Path(kwargs["embeddings"])
                 yield from super().generate(*args, **kwargs)
 
-        self.tok = self.svc.tok = Tokenizer()
-        self.svc.template = ChatTemplate(ROOT / "tools/ds4/chat_template.jinja")
-        image_token = self.tok.special_tokens[ds4_vision.PLACEHOLDER]
         with tempfile.TemporaryDirectory() as directory:
-            self.svc.vision = Vision(ds4_vision.Geometry(image_token=image_token), Path(directory), None)
+            self.svc.vision = Encoder(directory)
             for background in (False, True):
                 with self.subTest(background=background):
                     self.engine = self.svc.engine = Engine(self.tok, "Image received")
@@ -371,28 +338,11 @@ class BackgroundResponses(ResponseCase):
                         out = self.wait(out["id"])
                     self.assertEqual(out["status"], "completed")
                     self.assertEqual(self.svc.vision.thread, self.engine.thread)
-                    magic, count, start, width, height = struct.unpack("<4siqii", self.engine.image_bytes[:24])
-                    self.assertEqual((magic, count, width, height), (b"DSI1", 1, 2, 2))
-                    self.assertEqual(self.engine.last_prompt[start:start + 4], [image_token] * 4)
-                    self.assertEqual(self.engine.image_bytes[24:], b"\x7f" * 12)
-                    self.assertFalse(Path(self.engine.last_embeddings).exists())
-                    self.assertEqual(list(Path(directory).iterdir()), [])
-
-    def test_ds4_cancel_during_picture_preparation_stops_before_writing(self):
-        cancel = threading.Event()
-
-        class Vision(ds4_vision.Vision):
-            def picture(self, source):
-                cancel.set()
-                return ds4_vision.Picture(b"\x7f" * 12, 2, 2, 1, 1)
-
-        with tempfile.TemporaryDirectory() as directory:
-            self.svc.vision = Vision(ds4_vision.Geometry(), Path(directory), None)
-            with self.assertRaisesRegex(ValueError, "cancelled"):
-                self.svc.prepare([{"role": "user", "content": [{"type": "image", "source": "fixture"}]}],
-                                 None, {}, cancel=cancel)
-            self.assertIsNone(getattr(self.svc.embeddings, "path", None))
-            self.assertEqual(list(Path(directory).iterdir()), [])
+                    self.assertEqual(self.engine.image_bytes, data)
+                    image_token = self.tok.special_tokens["<|image_pad|>"]
+                    self.assertEqual(self.engine.last_prompt.count(image_token), 2)
+                    self.assertFalse(self.engine.embeddings_path.exists())
+                    self.assertEqual([p.name for p in Path(directory).iterdir()], ["cached.sve"])
 
     @unittest.skipUnless(openai, "optional OpenAI SDK is not installed")
     def test_sdk_background_retrieve_stream_cancel_and_delete(self):

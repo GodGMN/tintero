@@ -1,46 +1,56 @@
-"""tools/maya_names.py - Maya's settings are MAYA_*; the older STRATA_* names still work as fallbacks: the environment
-and a config's "env" take either, the code reads MAYA_* (MAYA_X first, then STRATA_X), on disk and on screen they are MAYA_*.
-
-    alias_env(os.environ)    every STRATA_X that has no MAYA_X also sets MAYA_X (MAYA_X wins), so what a program reads and
-                             what it starts (the engines) find the setting under the name they read
-    env_in(cfg)              a config as read from disk: its "env" under the names the code reads
-    env_out(cfg)             a config about to be written: its "env" under the names users see
-"""
+"""Resolve public TINTERO_* settings and keep the existing MAYA_* and STRATA_* readers working."""
 from __future__ import annotations
 
 import os
 
 OLD, NEW = "STRATA_", "MAYA_"
+PUBLIC = "TINTERO_"
+PUBLIC_SUFFIXES = frozenset("""
+    API_KEY DRAIN_S ENGINE_QUIT_S ENGINE_STALL_S ENGINE_WRAP_S FAIR_SLICE_S HTTP_BACKLOG
+    LOOP_GUARD LOOP_GUARD_COLLAPSE_MAX MAX_BODY_MIB MODEL_MANAGEMENT PROMPT_MEMO QUEUE_PING_S
+    REQUEST_QUIET_S REQUEST_TIMEOUT_S SERVER_LOG UPDATE_CHECK
+""".split()) | {
+    "GLM_RESPONSES_" + suffix for suffix in """
+        CACHE_ENTRIES CACHE_BYTES CACHE_TTL_S ENTRY_BYTES OWNER_ENTRIES OWNER_BYTES ASSEMBLY_BYTES
+        JOB_WORKERS JOB_ENTRIES JOB_OWNER_ENTRIES JOB_TIMEOUT_S JOB_TTL_S JOB_INPUT_BYTES
+        EVENT_BYTES EVENT_COUNT STREAM_READERS STREAM_OWNER_READERS STREAM_TIMEOUT_S
+    """.split()
+}
 
 
 def shown(name: str) -> str:
-    """A setting's name as users see it."""
-    return NEW + name[len(OLD):] if name.startswith(OLD) else name
+    """The public spelling used in settings written to disk and shown to users."""
+    key = read_as(name)
+    suffix = key.removeprefix(NEW)
+    return PUBLIC + suffix if key.startswith(NEW) and suffix in PUBLIC_SUFFIXES else key
 
 
 def read_as(name: str) -> str:
-    """A setting's name as the code reads it (MAYA_*; the older STRATA_* name is the fallback)."""
-    return shown(name)
+    """The spelling used by existing Python and child process readers."""
+    if name.startswith(OLD):
+        return NEW + name[len(OLD):]
+    if name.startswith(PUBLIC) and name[len(PUBLIC):] in PUBLIC_SUFFIXES:
+        return NEW + name[len(PUBLIC):]
+    return name
 
 
 def alias_env(env) -> None:
-    """In place (os.environ too): every STRATA_X that has no MAYA_X sets MAYA_X (the MAYA_ one counts when both are set)."""
+    """Populate the existing runtime keys in place, including when the winning value is empty."""
     for k, v in list(env.items()):
-        if k.startswith(OLD) and shown(k) not in env:
-            env[shown(k)] = v
+        key = read_as(k)
+        if (k.startswith(OLD) and key not in env) or (k.startswith(PUBLIC) and key != k):
+            env[key] = v
 
 
 def both_names(name: str) -> tuple[str, str]:
     """(MAYA_X, STRATA_X) for a setting under either name; a name with neither prefix is its own twice."""
-    m = shown(name)
+    m = read_as(name)
     return m, (OLD + m[len(NEW):] if m.startswith(NEW) else m)
 
 
 def lookup(env, name: str, default=None):
-    """A setting from a dict/environment by either of its names (the MAYA_ one first).  A config in memory has its
-    settings under the names the code reads (env_in), the shell and the dashboard under the names users see - code
-    that reads a setting from either must not care which."""
-    for k in both_names(name):
+    """Read a setting in order of preference, preserving an empty value."""
+    for k in (shown(name), *both_names(name)):
         v = env.get(k)
         if v is not None:
             return v
@@ -48,22 +58,25 @@ def lookup(env, name: str, default=None):
 
 
 def export_env(target, env) -> None:
-    """Put a config's "env" into `target` (a child's environment, os.environ) under BOTH names, so the program that
-    reads a setting as getenv("MAYA_X") and the one that reads getenv("STRATA_X") each find it (issue #686: env_in
-    leaves a config with the STRATA_ name only, and an engine that reads the MAYA_ name alone never saw it)."""
-    for k, v in sorted((env or {}).items(), key=lambda kv: str(kv[0]).startswith(NEW)):   # (a MAYA_ key last: it wins)
-        for name in {str(k), *both_names(str(k))}:
+    """Apply a config to an environment under the spellings its readers accept."""
+    for k, v in _normalized_env({str(k): v for k, v in (env or {}).items()}).items():
+        for name in {shown(k), *both_names(k)}:
             target[name] = str(v)
 
 
+def _normalized_env(env):
+    out = {}
+    for name, value in env.items():
+        key = read_as(name)
+        out[key] = env.get(shown(key), env.get(key, value))
+    return out
+
+
 def env_in(cfg):
-    """A config as read from disk -> its "env" under the names the code reads (in place; returned).  Where a config
-    has a setting under both names, the MAYA_ one counts."""
+    """Normalize a config's env keys in place for existing readers."""
     e = cfg.get("env") if isinstance(cfg, dict) else None
     if isinstance(e, dict):
-        out = {shown(k): v for k, v in e.items() if not k.startswith(NEW)}
-        out.update({k: v for k, v in e.items() if k.startswith(NEW)})
-        cfg["env"] = out
+        cfg["env"] = _normalized_env(e)
     return cfg
 
 
@@ -72,7 +85,7 @@ def env_out(cfg):
     e = cfg.get("env") if isinstance(cfg, dict) else None
     if not isinstance(e, dict):
         return cfg
-    return {**cfg, "env": {shown(k): v for k, v in e.items()}}
+    return {**cfg, "env": {shown(k): v for k, v in _normalized_env(e).items()}}
 
 
-alias_env(os.environ)   # (importing this module is enough: an older STRATA_X in the environment also counts as MAYA_X)
+alias_env(os.environ)
