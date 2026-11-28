@@ -5,6 +5,7 @@ Choose a JSON file from `docs/inkling2-mini/`.
 | GPU | Workload | Preset | GGUF | KV cache | Context budget |
 | --- | --- | --- | --- | --- | ---: |
 | RX 7900 XTX (`gfx1100`) | Single conversation | `ik2-mini-gfx1100.json` | IQ4_NL | FP8 | 393,216 |
+| RX 7900 XTX (`gfx1100`) | Coding in one conversation, MTP drafter | `ik2-mini-gfx1100-mtp.json` | IQ4_NL | FP8 | 262,144 |
 | Strix Halo (`gfx1151`, experimental) | Long context on unified RAM | `strix-halo-gfx1151.json` | IQ4_NL | Paged FP4 | 524,288 |
 | RTX 3090, 4090 or 5090 with 24 GB+ | Long chat on one card | `cuda-24gb-fp4.json` | IQ4_NL | FP4 global | 262,144 |
 | A100 or H100 with 80 GB | Long chat with FP8 KV | `cuda-80gb.json` | IQ4_NL | FP8 | 393,216 |
@@ -47,6 +48,25 @@ The RX 7900 XTX ran stock IQ4_NL on ROCm 7.2.1 with all experts resident, one gr
 
 The historical A100-SXM4-80GB run used CUDA 13.0, stock IQ4_NL, one stream and 393,216 FP8 positions. It reported 98.8 decode tok/s and 2,155–2,184 prefill tok/s across 4K–32K inputs. The report gives no per-depth mapping. [Original A100 measurement](https://github.com/GodGMN/tintero/commit/99c2668e)
 
+### RX 7900 XTX with the MTP drafter
+
+This sweep ran stock IQ4_NL and the official `mtp.safetensors` on ROCm 7.2.1 with all experts resident, one stream, FP8 KV, 32,768 positions and a 1,024-token chunk. Each configuration loaded on an idle card three times, in a different shuffled order each round. Every load answered the same five coding prompts at temperature 0 with up to 2,048 output tokens. Three prompts were saved turns from a coding agent with 1,268, 11,971 and 17,314 input tokens. The other two asked for new code and for an edit. Rates are generated tokens over the engine's decode time, so prefill is excluded. The table gives the median of the three rounds. Fixed windows varied by under 1% between rounds and adaptive ones by up to 5.4%.
+
+| Maximum window | Decode (tok/s) | Versus plain | Drafts accepted | Tokens per window |
+| --- | ---: | ---: | ---: | ---: |
+| Plain (no drafter) | 104.9 | — | — | — |
+| 2 | 107.4 | +2% | 98% | 1.98 |
+| 3 | 138.1 | +32% | 94% | 2.88 |
+| 4 | 164.3 | +57% | 92% | 3.75 |
+| 5 | 181.3 | +73% | 88% | 4.49 |
+| 6 | 195.7 | +87% | 86% | 5.11 |
+| 7 | 199.2 | +90% | 81% | 5.50 |
+| 8 | 213.4 | +103% | 81% | 6.32 |
+
+These rows use the adaptive controller. With `IK2_DRAFT_ADAPT=0`, every width was within 3% of its adaptive result. At width 8 the five prompts decoded at 182–248 tok/s, against 98–116 without the drafter. Most drafted answers differed from the plain greedy answers, so this sweep measures speed, not answer quality. Prose was not part of the sweep. An earlier single 257-token story slowed from 116 to 89 tok/s with the drafter, which is why the general preset stays plain.
+
+`ik2-mini-gfx1100-mtp.json` applies width 8 at 262,144 positions with a 65,536-position drafter cache, using 23.8 GB of VRAM after loading. At that reservation it decoded the new-code, 17K-token agent and edit prompts at 205, 207 and 227 tok/s. The drafter does not fit beside the 393,216-position reservation of the general preset.
+
 ## Run a preset
 
 Put the matching GGUF in `models/` and export its tokenizer from the package root.
@@ -56,13 +76,13 @@ python3 tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-IQ4_NL.gguf \
   --out ik2 --chat-template tools/ik2/chat_template.jinja
 ```
 
-The single-user DGX Spark preset uses adaptive MTP. Download the drafter beside the GGUF before starting this preset.
+The single-user DGX Spark preset and the RX 7900 XTX coding preset use adaptive MTP. Download the drafter beside the GGUF before starting either preset.
 
 ```sh
 hf download thinkingmachines/Inkling-2-Mini mtp.safetensors --local-dir models
 ```
 
-The default verification window has room for the current token and up to four guesses. Set `IK2_DRAFT_WIDTH` (2–8) to change the maximum window. For plain decoding, use a copy of the preset with `--draft` and its filename removed from `args`.
+The default verification window has room for the current token and up to four guesses. The RX 7900 XTX coding preset raises it to eight positions with `IK2_DRAFT_WIDTH=8`. Set `IK2_DRAFT_WIDTH` (2–8) to change the maximum window. For plain decoding, use a copy of the preset with `--draft` and its filename removed from `args`.
 
 For CUDA containers, mount both directories under `/opt/tintero`.
 
