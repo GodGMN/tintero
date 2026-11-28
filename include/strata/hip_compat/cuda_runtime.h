@@ -90,7 +90,13 @@ inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
 #define cudaHostAllocDefault hipHostAllocDefault
 #define cudaHostAllocMapped hipHostAllocMapped
 #define cudaHostAllocPortable hipHostAllocPortable
-#define cudaHostGetDevicePointer hipHostGetDevicePointer
+template <typename T>
+inline hipError_t cudaHostGetDevicePointer(T** device, void* host, unsigned int flags) {
+    void* mapped = nullptr;
+    const hipError_t result = hipHostGetDevicePointer(&mapped, host, flags);
+    if (result == hipSuccess) *device = static_cast<T*>(mapped);
+    return result;
+}
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostRegisterPortable hipHostRegisterPortable

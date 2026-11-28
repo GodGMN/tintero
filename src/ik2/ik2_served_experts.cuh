@@ -1,4 +1,4 @@
-// Included beside the token graph so launches use its stream and captured addresses.
+// GPU-served expert tables shared by startup and token graph replay.
 struct ServedLayer {
     ik2::ServedSlots slots;
     uint8_t *cold, *cache;
@@ -85,6 +85,6 @@ struct ServedExperts {
         }
         CU(cudaMemcpyAsync(device, host, entries * sizeof(*host), cudaMemcpyHostToDevice, g_s));
     }
-} served;
+};
 
-#include "ik2_served_kernels.cuh"
+extern ServedExperts served;

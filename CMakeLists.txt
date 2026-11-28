@@ -27,6 +27,20 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
 endif()
 find_package(Threads REQUIRED)
 
+set(ik2_kernel_sources
+  src/ik2/ik2_kernels.cu
+  src/ik2/ik2_attention_kernels.cu
+  src/ik2/ik2_draft_kernels.cu
+  src/ik2/ik2_matmul_kernels.cu
+  src/ik2/ik2_sampling_kernels.cu
+)
+
+set(ik2_engine_sources
+  src/ik2/ik2_main.cu
+  src/ik2/ik2_prefill.cu
+  src/ik2/ik2_decode.cu
+)
+
 if(STRATA_ENABLE_HIP)
   set(CMAKE_HIP_ARCHITECTURES "gfx1100;gfx1151" CACHE STRING "HIP targets")
   foreach(arch IN LISTS CMAKE_HIP_ARCHITECTURES)
@@ -39,7 +53,7 @@ if(STRATA_ENABLE_HIP)
   find_package(hip CONFIG REQUIRED)
   find_package(hipblas CONFIG REQUIRED)
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-  set_source_files_properties(src/ik2/ik2_kernels.cu src/ik2/ik2_main.cu
+  set_source_files_properties(${ik2_kernel_sources} ${ik2_engine_sources}
     src/ik2/ik2_draft.cu tests/ik2_kernels_test.cu tests/ik2_dflash2_test.cu PROPERTIES LANGUAGE HIP)
 else()
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -74,11 +88,11 @@ else()
   set(CMAKE_CUDA_ARCHITECTURES "${archs}")
 endif()
 
-add_library(ik2_kernels STATIC src/ik2/ik2_kernels.cu)
+add_library(ik2_kernels STATIC ${ik2_kernel_sources})
 target_include_directories(ik2_kernels PUBLIC src/ik2)
 add_library(ik2_draft STATIC src/ik2/ik2_draft.cu)
 target_link_libraries(ik2_draft PUBLIC ik2_kernels)
-add_executable(tintero src/ik2/ik2_main.cu src/ik2/ik2_cpu.cpp)
+add_executable(tintero ${ik2_engine_sources} src/ik2/ik2_cpu.cpp)
 target_link_libraries(tintero PRIVATE ik2_draft Threads::Threads)
 
 if(STRATA_ENABLE_HIP)
