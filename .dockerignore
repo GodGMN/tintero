@@ -5,3 +5,10 @@
 build
 build-*
 models
+# the ablation lab's scripts stay out of release bundles and images; only its runtime assets (directions/) go in
+# (tools/ik2_ablate/MANIFEST.json), and the tests of lab code and of this packaging stay beside the sources
+tools/ik2_ablate/*
+!tools/ik2_ablate/directions
+tools/test_ik2_grade.py
+tools/test_apply_lora_gguf.py
+tools/test_ik2_ablate_packaging.py

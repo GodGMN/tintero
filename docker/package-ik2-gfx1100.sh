@@ -65,13 +65,10 @@ if host_vision.is_file():
 PYCONFIG
 fi
 cp -R "$root/serve" "$context/"
-mkdir "$context/tools" "$context/tests"
+mkdir "$context/tests"
 cp "$root/tests"/ik2*.py "$context/tests/"
 cp -R "$root/ref" "$context/ref"
-cp -R "$root/tools"/ik2* "$context/tools/"
-for name in strata_tokenizer gguf_reader gguf_writer maya_quants maya_names ablate_fit needle_bench inkling2_gguf; do
-    cp "$root/tools/$name.py" "$context/tools/"
-done
+sh "$root/docker/stage-ik2-tools.sh" "$root" "$context"
 cp "$root/third_party/ggml/LICENSE" "$context/LICENSE.ggml"
 find "$context" -name __pycache__ -type d -prune -exec rm -rf '{}' +
 docker buildx build --load --resource memory=6g --resource memory-swap=6g \
