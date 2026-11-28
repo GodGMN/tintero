@@ -17,6 +17,7 @@
 
 ## Tests and measurements
 
+- [Run or schedule the local GPU smoke check](GPU-SMOKE.md)
 - [Run the kernel and host reference tests](HIP-PORT.md#verification)
 - [Compare decode logits with the CPU reference](HIP-PORT.md#forced-decode-comparison)
 - [RX 7900 XTX throughput and VRAM measurements](HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
