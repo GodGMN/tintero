@@ -18,11 +18,38 @@ int main() {
     if (table[5] != cache + 2 || table[0] != cache || table[1] != cold + 1 ||
         table[3] != cold + 3 || slots.reserve != std::vector<int>{1, 3, 4}) return 1;
 
+    // Profile-warmed initialization places the hottest experts in slots 0..hot-1.
+    const uint64_t profile[]{10, 500, 20, 900, 500, 0, 1};
+    const auto ranked = ik2::rank_hot_experts(profile, 7, 3);
+    if (ranked != std::vector<int>{3, 1, 4}) return 2;
+    ik2::ServedSlots warmed(6, 3, ranked);
+    warmed.write_table(table, 7, cold, cache, 1);
+    if (table[3] != cache || table[1] != cache + 1 || table[4] != cache + 2 ||
+        table[0] != cold || table[2] != cold + 2 || table[7] != cache + 3) return 3;
+
     // With only reserves every address must revert to its mapped source between tokens.
     ik2::ServedSlots tiny(2, 2);
     tiny.owner = {3, 5};
     tiny.refill(frequency);
     tiny.write_table(table, 7, cold, cache, 1);
-    if (table[3] != cold + 3 || table[5] != cold + 5 || table[7] != cache || table[8] != cache + 1) return 1;
-    std::puts("served expert table and LFU refill passed");
+    if (table[3] != cold + 3 || table[5] != cold + 5 || table[7] != cache || table[8] != cache + 1) return 4;
+    // Visit-weighted ROI allocation: looped layers (3 visits/token) must receive more hot slots than
+    // single-visit layers under a constrained VRAM budget.
+    {
+        std::vector<std::size_t> sb = {4300000, 4300000, 8100000};
+        std::vector<int> vis = {3, 1, 1};
+        const auto hot = ik2::allocate_served_hot_slots(sb, vis, 128, 300ULL * 1024 * 1024);
+        if (!(hot[0] > hot[1] && hot[1] >= hot[2] && hot[0] >= 40)) {
+            std::fprintf(stderr, "visit-weighted hot allocation failed: [%d, %d, %d]\n", hot[0], hot[1], hot[2]);
+            return 1;
+        }
+        std::size_t used = 0;
+        for (int l = 0; l < 3; ++l) used += std::size_t(hot[l]) * sb[l];
+        if (used > 300ULL * 1024 * 1024) {
+            std::fprintf(stderr, "hot allocation exceeded budget\n");
+            return 1;
+        }
+    }
+
+    std::puts("served expert table, profile warming, visit-weighted allocation and LFU refill passed");
 }

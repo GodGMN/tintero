@@ -4,11 +4,33 @@
 #include "ik2_cpu_deep.hpp"
 #include <immintrin.h>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 
 namespace ik2::cpu {
+static void* alloc_aligned64(size_t bytes) {
+#ifdef _WIN32
+    void* p = _aligned_malloc(bytes, 64);
+    if (!p) throw std::bad_alloc();
+    return p;
+#else
+    void* p = nullptr;
+    if (posix_memalign(&p, 64, bytes)) throw std::bad_alloc();
+    return p;
+#endif
+}
+static void free_aligned64(void* p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
 struct alignas(32) Block {
     int8_t w[16][8];
     float d[8];
@@ -91,8 +113,8 @@ struct PackedLayer {
     float* hidden32;
     ~PackedLayer() {
         for (auto* ptr : parts)
-            std::free(ptr);
-        std::free(hidden32);
+            free_aligned64(ptr);
+        free_aligned64(hidden32);
     }
 };
 std::shared_ptr<PackedLayer> pack_layer(int C, int F, int K, int E, const uint8_t* const raw[3], const size_t stride[3],
@@ -110,7 +132,7 @@ std::shared_ptr<PackedLayer> pack_layer(int C, int F, int K, int E, const uint8_
                                                           buffers.output,
                                                           buffers.hidden,
                                                           nullptr});
-    if (posix_memalign((void**)&L->hidden32, 64, (size_t)K * F * sizeof(float))) throw std::bad_alloc();
+    L->hidden32 = static_cast<float*>(alloc_aligned64((size_t)K * F * sizeof(float)));
     const int8_t table[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
     float deq[256];
     for (int i = 0; i < 256; ++i) {
@@ -120,37 +142,36 @@ std::shared_ptr<PackedLayer> pack_layer(int C, int F, int K, int E, const uint8_
     }
     for (int p = 0; p < 3; ++p) {
         int n = p == 2 ? C : F, k = p == 2 ? F : C;
-        size_t tiles = (size_t)E * (n / 8);
+        const ptrdiff_t tiles = (ptrdiff_t)E * (n / 8);
         if (q8) {
-            Q8Block* data;
-            if (posix_memalign((void**)&data, 64, tiles * (k / 32) * sizeof(Q8Block))) throw std::bad_alloc();
+            auto* data = static_cast<Q8Block*>(alloc_aligned64((size_t)tiles * (k / 32) * sizeof(Q8Block)));
             L->parts[p] = (Block*)data;
 #pragma omp parallel for num_threads(nt) schedule(static)
-            for (size_t tile = 0; tile < tiles; ++tile) {
-                const int expert = tile / (n / 8), r0 = (tile % (n / 8)) * 8;
-                Q8Block* dst = data + tile * (k / 32);
+            for (ptrdiff_t tile = 0; tile < tiles; ++tile) {
+                const int expert = (int)(tile / (n / 8)), r0 = (int)(tile % (n / 8)) * 8;
+                Q8Block* dst = data + (size_t)tile * (k / 32);
                 for (int sb = 0; sb < k / 32; ++sb)
                     for (int j = 0; j < 8; ++j) {
-                        const uint8_t* q = raw[p] + expert * stride[p] + ((r0 + j) * (k / 32) + sb) * 34;
+                        const uint8_t* q = raw[p] + (size_t)expert * stride[p] + ((size_t)(r0 + j) * (k / 32) + sb) * 34;
                         uint16_t h;
                         std::memcpy(&h, q, sizeof(h));
-                        dst[sb].d[j] = _cvtsh_ss(h);
+                        dst[sb].d[j] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));
                         for (int z = 0; z < 32; ++z)
                             dst[sb].w[z][j] = (int8_t)q[2 + z];
                     }
             }
             continue;
         }
-        if (posix_memalign((void**)&L->parts[p], 64, tiles * (k / 16) * sizeof(Block))) throw std::bad_alloc();
+        L->parts[p] = static_cast<Block*>(alloc_aligned64((size_t)tiles * (k / 16) * sizeof(Block)));
 #pragma omp parallel for num_threads(nt) schedule(static)
-        for (size_t tile = 0; tile < tiles; ++tile) {
-            const int expert = tile / (n / 8), r0 = (tile % (n / 8)) * 8;
-            const size_t rb = k / 64 * 36;
-            Block* dst = L->parts[p] + tile * (k / 16);
+        for (ptrdiff_t tile = 0; tile < tiles; ++tile) {
+            const int expert = (int)(tile / (n / 8)), r0 = (int)(tile % (n / 8)) * 8;
+            const size_t rb = (size_t)(k / 64) * 36;
+            Block* dst = L->parts[p] + (size_t)tile * (k / 16);
             for (int s = 0; s < k / 16; ++s) {
                 Block& b = dst[s];
                 for (int j = 0; j < 8; ++j) {
-                    const uint8_t* q = raw[p] + expert * stride[p] + (r0 + j) * rb + (s / 4) * 36;
+                    const uint8_t* q = raw[p] + (size_t)expert * stride[p] + (size_t)(r0 + j) * rb + (size_t)(s / 4) * 36;
                     b.d[j] = deq[q[s % 4]];
                     q += 4 + (s % 4) * 8;
                     for (int z = 0; z < 8; ++z) {

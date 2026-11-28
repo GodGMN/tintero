@@ -135,18 +135,15 @@ tokenizer folder and the run config, then `python serve/server.py --engine maya 
 none, low (0.2), medium (0.7), high (0.9), xhigh and max (0.99); Off is none.
 
 The engine sizes the expert cache after allocating weights, KV for the requested context and scratch buffers.
-Streaming reserves another 2 GiB. On one GPU, `--vram-gb N` simulates a device budget in GiB. The cache is
-limited by both actual free memory and the simulated budget after device allocations. Pinned host experts
-are outside the simulated budget.
+Streaming reserves adaptive headroom (`512 MiB`–`2 GiB`, scaling with total VRAM so 12 GB cards keep more room for experts). On one GPU, `--vram-gb N` simulates a device budget in GiB, and `--ram-gb N` (or `IK2_RAM_GB=N`, `0` allowed) caps host RAM for experts in GiB. When `--ram-gb` is unset, Tintero automatically sizes host RAM leaving OS headroom (`max(4 GiB, 15%)` on Windows, `max(2 GiB, 10%)` on Linux). If the host RAM budget cannot hold all experts, Tintero automatically switches to a 3-tier **VRAM -> pinned RAM -> parallel Direct-I/O disk** store (`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux), pre-warming VRAM with the hottest profile experts and RAM with the next hottest disjoint set, and reporting per-tier hit rates.
 
 The engine saves a binary profile for each canonical model path under
 `$XDG_CACHE_HOME/tintero` (default `~/.cache/tintero` on Unix, `%LOCALAPPDATA%/tintero` on Windows).
-On the next launch, each pool loads its most frequently selected experts with an initial eviction frequency
-of at most two. Counts accumulate across launches and halve together when a counter would overflow.
+On the next launch, each pool (including `IK2_GPU_SERVED=1` hot slots and 3-tier RAM slots) loads its most frequently selected experts. Counts accumulate across launches and halve together when a counter would overflow.
 Concurrent sessions publish complete snapshots; the last clean shutdown supplies the next profile.
 
-Engine flags: `--max-context N` (262144), `--cache-gb N` (optional expert-cache ceiling in GiB),
-`--gpus 1|2`, `--threads N` (8: the loading and the CPU lane), `--eos a,b`. Environment:
+Engine flags: `--max-context N` (262144), `--cache-gb N` (optional expert-cache ceiling in GiB), `--vram-gb N`, `--ram-gb N`,
+`--gpus 1|2`, `--threads N` (8: the loading, parallel disk I/O and CPU lane), `--eos a,b`. Environment:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
@@ -166,7 +163,10 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (optional expert-cache 
 | `IK2_FAST_LOAD` | on (CUDA resident mmap) | Stage resident expert mmap uploads through a temporary double-buffered `2 × 64 MiB` pinned ring packed across CPU threads, then free the staging buffers after load (DGX Spark GB10: 14.7 GiB in 0.6 s vs 43.3 s unpinned mmap). Set `0` to copy each expert directly from mmap. |
 | `IK2_BATCH_GROUP_MOE` | off | CUDA continuous batching, up to 512 routed slots. Speculative verification always groups routed slots. `0` runs per token. `1` groups rows by expert and uses scalar products for IQ4_NL and Q8_0. `2` additionally uses Tensor-Core MMA when gate, up and down share either format and both dimensions are multiples of 32. MMA rounding can change token IDs. |
 | `IK2_BLACKWELL_NVFP4` | off | On SM 120a and 121a, `1` quantizes grouped expert activations to E2M1 with a UE4M3 scale per 16 values and uses block-scaled FP4 MMA for gate/up and down. This can change logits. The single-token decode path uses its existing precision. |
-| `IK2_GPU_SERVED` | off | Single-GPU CUDA token decode. Use `--cache-gb N` to budget the prompt cache, resident expert slots and per-visit reserves together. Expert weights require pinned mapped host memory. The CLI reports GPU copies, refilled slots and repeat picks served by copies from an earlier loop pass. |
+| `IK2_GPU_SERVED` | off | Single-GPU CUDA token decode. Uses pinned mapped host RAM for cold experts, pre-warms hot VRAM slots from the saved expert profile, and serves misses inside the CUDA token graph. Automatically falls back to the 3-tier VRAM/RAM/disk store when the host RAM budget is smaller than the model's experts. |
+| `IK2_RAM_GB` | auto | Host RAM ceiling in GiB for experts (`0` forces pure VRAM + disk staging). Same as `--ram-gb N`. |
+| `IK2_DIRECT_IO` | `1` | Bypass the OS page cache when reading experts from disk (`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux). Set `0` to use buffered reads. |
+| `IK2_TIER_STORE` | `0` | Force the 3-tier `HostExpertStore` even when all experts fit in host RAM (for testing/statistics). |
 | `IK2_FAST` | on when every expert fits in VRAM | the resident token path (docs/INKLING2.md 8): every expert in VRAM, a token's launches with nothing from the host between its embedding and its logits. `0`: tokens take the cache path |
 | `IK2_GRAPH` | on | `0`: the resident path's launches one by one instead of a CUDA graph a token (for profiling: nsys does not see inside a graph) |
 | `IK2_ATTN_MMA` | `1` | a token's attention on the tensor cores, a warp straight from the KV cache (65,536 tokens deep on an RTX 3090: 63 -> 77 tok/s with an FP16 cache, 53 -> 84 with FP8). `0`: the scalar kernels; `2`: the layers without a window only |
