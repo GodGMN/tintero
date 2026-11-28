@@ -2,6 +2,66 @@
 
 The [gfx1100 preset](inkling2-mini/ik2-mini-gfx1100.json) supplies the Radeon defaults. See the [HIP guide](HIP-PORT.md) for slot counts, memory use and tested cache sizes.
 
+## Environment and build settings
+
+Use the `TINTERO_*` names below for new configurations. The corresponding
+`MAYA_*` spellings remain available. When both spellings appear in the same
+source, Tintero uses `TINTERO_*`, even if its value is empty. Existing
+`STRATA_*` fallbacks for Python and CMake come after both. Empty values keep
+the setting's existing behavior. For example, an empty API key falls through
+to the top-level `api_key` in the run config, and an empty gfx1100 preset
+override selects the automatic preset.
+
+Export the server settings before running `python -m serve.server`. Settings
+marked **yes** in the JSON column can also go in the run config's `env` object.
+A non-null entry there takes precedence over the inherited environment for
+that setting, including when the two sources use different spellings.
+`--api-key` can override the inherited API key.
+
+| Setting | JSON | Default | Effect |
+| --- | --- | --- | --- |
+| `TINTERO_API_KEY` | | Empty | Requires one of these comma-separated API keys. |
+| `TINTERO_MODEL_MANAGEMENT` | | On | Enables the load, unload and model event API. Falls back to the top-level `model_management` setting if empty or unset. |
+| `TINTERO_HTTP_BACKLOG` | Yes | 256 | Pending socket connections, with a minimum of 5. |
+| `TINTERO_MAX_BODY_MIB` | Yes | 256 | Maximum HTTP request body size in MiB. |
+| `TINTERO_REQUEST_TIMEOUT_S` | | 300 | Timeout in seconds for a socket read or write. |
+| `TINTERO_QUEUE_PING_S` | Yes | 2 | Seconds between streaming keep-alives while a request is queued. |
+| `TINTERO_FAIR_SLICE_S` | Yes | 0 | Seconds of decoding before yielding to another queued request where the engine supports it. Zero disables slicing. |
+| `TINTERO_ENGINE_STALL_S` | Yes | 90 | Seconds of inactivity before the stall watchdog can end an engine. Zero disables it. |
+| `TINTERO_REQUEST_QUIET_S` | Yes | 900 | Seconds without an engine event for a request before timing it out. Zero disables the timeout. |
+| `TINTERO_DRAIN_S` | Yes | 60 | Seconds to wait for a cancelled request to drain where the engine supports it. |
+| `TINTERO_ENGINE_QUIT_S` | | 50 | Seconds to wait for the engine to exit after sending QUIT. |
+| `TINTERO_ENGINE_WRAP_S` | | 40 | Seconds to let an active request finish on shutdown where the engine supports it. Zero or empty skips the wait. |
+| `TINTERO_LOOP_GUARD` | Yes | On | Controls the server's repetition detection. See [the loop guard](#the-loop-guard). |
+| `TINTERO_LOOP_GUARD_COLLAPSE_MAX` | | 32000 | Character threshold for repeated message collapse. Zero removes the limit. |
+| `TINTERO_PROMPT_MEMO` | Yes | On | Reuses tokenization work for repeated parts of prompts. Set to `0` to disable it. |
+| `TINTERO_SERVER_LOG` | Yes | The run config's `log` path, if present | Mirrors server output to this file. Empty or `0` keeps output on the terminal. |
+| `TINTERO_UPDATE_CHECK` | Yes | On | Set to `0` to disable the dashboard's update check. |
+| `TINTERO_GLM_RESPONSES_*` | Yes | [Responses limits](RESPONSES.md#settings-and-metrics) | Sets storage, job and event retention limits for `/v1/responses`. The `GLM` part of the name is historical. |
+
+`TINTERO_CONFIG`, `TINTERO_MODEL`, `TINTERO_HOST` and `TINTERO_PORT` are
+[container settings](PRESETS.md#run-a-preset) already using the Tintero prefix.
+The standalone gfx1100 package accepts `TINTERO_IK2_PRESET` in its shell
+launcher or Compose `.env`. Its older `MAYA_IK2_PRESET` name also works.
+
+CMake accepts `-DTINTERO_ENABLE_HIP=ON`, `-DTINTERO_ENABLE_CUDA=ON` and
+`-DTINTERO_BUILD_TESTS=ON`. Both GPU backends default to off and the test option
+defaults to `BUILD_TESTING`. The `MAYA_*` and `STRATA_*` equivalents still work.
+`IK2_*` names in the [Inkling engine settings](#inkling-2-small) keep their names.
+
+The `MAYA_MOCK_*`, `MAYA_TEST_*`, `MAYA_DEBUG`, `MAYA_TURN_TRACE` and
+`MAYA_PULL_COMMAND` variables are test or developer controls.
+`MAYA_RESTART_ON_UPDATE` is the installer's supervision signal.
+Legacy model tuning and packing variables, including `MAYA_DS4_*`,
+`MAYA_GLM_*` outside the Responses limits, and `MAYA_PACK_*`, keep their
+existing spellings where the legacy code still reads them. `MAYA_PAR_MAX`
+caps the legacy `--parallel` flag. Inkling uses `--cache-slots`.
+`MAYA_VIDEO_MAX_FRAMES` belongs to the legacy external vision path.
+`MAYA_SAVINGS_PATH` belongs to the legacy dashboard's savings ledger.
+Removed native engine settings in the changelog have no Tintero alias.
+`MAYA_VERSION` is read from the `VERSION` file, and `MAYA_TOKENIZER` occurs
+only in tests.
+
 ## When the engine stops an answer
 
 An answer ends with `finish_reason` "length" (Anthropic: `stop_reason` "max_tokens"; Responses: status "incomplete"
@@ -118,7 +178,7 @@ on hover what it did) and counts the loops since the start, as do `/metrics` (`l
 `/metrics/prometheus` (`maya:loop_guard_*_total`; the notes across turns: `[maya] loop guard: `bash` 3 times with the
 same arguments and result: a note after it`, `maya:loop_guard_tool_repeats_total`).
 
-Off for the server: `MAYA_LOOP_GUARD=0`, or `"loop_guard": false` in the run config. A request can choose for itself
+Off for the server: `TINTERO_LOOP_GUARD=0`, or `"loop_guard": false` in the run config. A request can choose for itself
 with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completions, Anthropic Messages).
 
 ## Inkling-2-Small
