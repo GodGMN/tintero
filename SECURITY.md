@@ -31,8 +31,9 @@ the quantization tools. The model weights are out of scope: they come from their
   - PyPI, through `pip`, when the setup installs its Python packages into `.venv`; on Windows with an AMD card, AMD's
     package index (`repo.amd.com`) for the ROCm SDK.
   - GitHub, when the web page asks whether a newer release exists (at most every six hours): the dashboard's
-    update check. `MAYA_UPDATE_CHECK=0` turns it off. Updating from the page runs `git fetch` against your checkout's
-    `origin`.
+    update check, against Tintero's releases (`GodGMN/tintero`) or, in a git checkout, its `origin`.
+    `TINTERO_UPDATE_CHECK=0` (or `MAYA_UPDATE_CHECK=0`) turns it off. Updating from the page runs `git fetch` against
+    your checkout's `origin`.
   - Addresses that you or your clients name: an `http(s)` image URL in a request, and the MCP servers you list in
     `"mcp_servers"` or `--mcp-config`.
   - We know of no other connection. Maya sends no usage data; your prompts and answers stay on the PC, and `./maya.sh --report` only writes `maya-report.txt`

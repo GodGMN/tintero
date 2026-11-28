@@ -6,7 +6,9 @@ git "origin" with two releases, nothing from the network.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -62,6 +64,111 @@ class Pieces(unittest.TestCase):
                 mock.patch.object(U.urllib.request, "urlopen") as net:
             self.assertFalse(U.Updater("1.0.17").check(force=True)["enabled"])
             net.assert_not_called()
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def fake_release(tag):
+    """What urlopen returns for the releases/latest request: a context manager whose read() is the API's JSON."""
+    body = json.dumps({"tag_name": tag, "html_url": f"https://github.com/GodGMN/tintero/releases/tag/{tag}",
+                       "body": "**Notes.**", "published_at": "2026-11-27T04:26:45Z"}).encode()
+    resp = mock.MagicMock()
+    resp.__enter__.return_value.read.return_value = body
+    return resp
+
+
+class ReleaseIdentity(unittest.TestCase):
+    """An installed distribution (a Docker image or a release tarball) has no .git: its identity is this repository's
+    VERSION file and the Tintero releases, never another project's."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.pkg = self.tmp / "opt" / "tintero"           # the layout of docker/Dockerfile.*: VERSION and serve/ side by side
+        (self.pkg / "serve").mkdir(parents=True)
+        shutil.copy(REPO_ROOT / "VERSION", self.pkg / "VERSION")
+        shutil.copy(REPO_ROOT / "serve" / "update.py", self.pkg / "serve" / "update.py")
+        env = {k: v for k, v in os.environ.items() if k not in U.UPDATE_CHECK_ENV}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def version(self, root=None):
+        return (Path(root or self.pkg) / "VERSION").read_text(encoding="utf-8").strip()
+
+    def check(self, tag, root=None, current=None):
+        u = U.Updater(current or self.version(root), root=root or self.pkg)
+        with mock.patch.object(U.urllib.request, "urlopen", return_value=fake_release(tag)) as net:
+            info = u.check(force=True)
+        return info, net.call_args.args[0]
+
+    def test_version_file_is_the_latest_released_version(self):
+        version = self.version(REPO_ROOT)
+        self.assertRegex(version, r"^\d+\.\d+\.\d+$", "VERSION must be MAJOR.MINOR.PATCH")
+        self.assertIsNotNone(U.vtuple(version))
+        headings = re.findall(r"^## v(\d+\.\d+\.\d+) - ", (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), re.M)
+        self.assertTrue(headings, "CHANGELOG.md lists no release")
+        self.assertEqual(version, headings[0], "VERSION is the newest release in CHANGELOG.md (Unreleased is not one)")
+        self.assertFalse(any(U.vtuple(h) > U.vtuple(version) for h in headings))
+
+    def test_the_fallback_repository_is_tintero(self):
+        self.assertEqual(U.REPO, "GodGMN/tintero")
+
+    def test_packaged_install_asks_tintero_releases(self):
+        self.assertFalse((self.pkg / ".git").exists())
+        info, req = self.check("v" + self.version())
+        self.assertEqual(req.full_url, "https://api.github.com/repos/GodGMN/tintero/releases/latest")
+        self.assertEqual(req.get_header("User-agent"), f"tintero/{self.version()}")
+        self.assertEqual(info["latest"]["repo"], "GodGMN/tintero")
+        self.assertIsNone(info["error"])
+
+    def test_packaged_install_at_the_latest_release_is_up_to_date(self):
+        info, _ = self.check("v" + self.version())
+        self.assertFalse(info["newer"])
+        self.assertEqual(info["current"], self.version())
+
+    def test_packaged_install_sees_a_newer_release_but_cannot_update_itself(self):
+        major, minor, patch = U.vtuple(self.version())
+        with mock.patch.dict(os.environ, {U.SUPERVISED: "1"}):          # even when started by maya.py
+            info, _ = self.check(f"v{major}.{minor}.{patch + 1}")
+        self.assertTrue(info["newer"])
+        self.assertFalse(info["can_update"])
+        self.assertIn("not a git checkout", info["blocker"])
+        self.assertIn("download", info["by_hand"])
+
+    def test_the_release_check_can_be_turned_off_under_either_name(self):
+        for key in ("TINTERO_UPDATE_CHECK", "MAYA_UPDATE_CHECK"):
+            with self.subTest(key=key), mock.patch.dict(os.environ, {key: "0"}), \
+                    mock.patch.object(U.urllib.request, "urlopen") as net:
+                self.assertFalse(U.Updater(self.version(), root=self.pkg).check(force=True)["enabled"])
+                net.assert_not_called()
+
+    def test_tintero_name_wins_over_the_maya_name(self):
+        with mock.patch.dict(os.environ, {"TINTERO_UPDATE_CHECK": "1", "MAYA_UPDATE_CHECK": "0"}):
+            self.assertTrue(U.Updater("0.1.0").enabled())
+        with mock.patch.dict(os.environ, {"TINTERO_UPDATE_CHECK": "0", "MAYA_UPDATE_CHECK": "1"}):
+            self.assertFalse(U.Updater("0.1.0").enabled())
+
+    @unittest.skipUnless(HAVE_GIT, "git is not installed")
+    def test_a_checkout_keeps_asking_its_own_origin(self):
+        for url, repo in (("git@github.com:SomeFork/tintero.git", "SomeFork/tintero"),
+                          ("https://github.com/GodGMN/tintero", "GodGMN/tintero"),
+                          ("https://example.org/mirror/tintero.git", U.REPO)):          # not GitHub: the fallback
+            with self.subTest(origin=url):
+                co = self.tmp / "co" / hex(abs(hash(url)))
+                co.mkdir(parents=True, exist_ok=True)
+                sh(co, "init")
+                sh(co, "remote", "add", "origin", url)
+                (co / "VERSION").write_text(self.version() + "\n")
+                info, req = self.check("v" + self.version(), root=co)
+                self.assertEqual(req.full_url, f"https://api.github.com/repos/{repo}/releases/latest")
+                self.assertEqual(info["latest"]["repo"], repo)
+
+    def test_a_tag_that_is_not_a_version_is_refused(self):
+        info, _ = self.check("nightly")
+        self.assertIn("could not be reached", info["error"])
+        self.assertFalse(info["newer"])
 
 
 @unittest.skipUnless(HAVE_GIT, "git is not installed")
