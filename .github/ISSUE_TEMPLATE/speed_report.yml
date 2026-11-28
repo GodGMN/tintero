@@ -1,76 +1,30 @@
 name: Speed report
-description: Share how fast Maya runs on your PC
+description: Share Tintero benchmark results
 labels: ["speed-report"]
 body:
   - type: markdown
     attributes:
       value: |
-        Run `./maya.sh --bench` (Windows: `START-MAYA.bat --bench`), then `./maya.sh --report`, and attach `maya-report.txt`. It includes the benchmark.
-  - type: input
-    id: gpus
+        Follow the [benchmark guide](https://github.com/GodGMN/tintero/blob/main/docs/BENCHMARK.md) to generate a Markdown table.
+  - type: textarea
+    id: results
     attributes:
-      label: GPUs, how many, and VRAM
-      placeholder: 2x RTX 3090 24 GB
-    validations:
-      required: true
-  - type: input
-    id: cpu
-    attributes:
-      label: CPU
-    validations:
-      required: true
-  - type: input
-    id: ram
-    attributes:
-      label: RAM
-    validations:
-      required: true
-  - type: input
-    id: os
-    attributes:
-      label: Operating system
-    validations:
-      required: true
-  - type: input
-    id: model
-    attributes:
-      label: Model and quant
-      placeholder: GLM-5.3-Flash, Maya-S (or GLM-5.3, UD-IQ2_M)
-    validations:
-      required: true
-  - type: input
-    id: context
-    attributes:
-      label: Context length
-  - type: input
-    id: prompt
-    attributes:
-      label: Prompt length (tokens)
-  - type: input
-    id: prefill
-    attributes:
-      label: Prefill (reading the prompt), tokens/s
-    validations:
-      required: true
-  - type: input
-    id: decode
-    attributes:
-      label: Decode (writing the answer), tokens/s
-    validations:
-      required: true
-  - type: input
-    id: version
-    attributes:
-      label: Maya version
+      label: Benchmark table
+      description: Paste the contents of speed-report.md.
     validations:
       required: true
   - type: textarea
     id: command
     attributes:
-      label: The command or config you used
+      label: Benchmark command
+      description: Include any environment variables you set and the token IDs if you used a different token file.
       render: shell
+    validations:
+      required: true
   - type: textarea
-    id: report
+    id: system
     attributes:
-      label: maya-report.txt
-      description: Drag the file here, or paste its text.
+      label: System and driver
+      placeholder: Ubuntu 24.04, NVIDIA driver 580, CUDA 13, Ryzen 5 5600, 64 GB RAM
+    validations:
+      required: true
