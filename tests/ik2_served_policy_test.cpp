@@ -33,5 +33,23 @@ int main() {
     tiny.refill(frequency);
     tiny.write_table(table, 7, cold, cache, 1);
     if (table[3] != cold + 3 || table[5] != cold + 5 || table[7] != cache || table[8] != cache + 1) return 4;
-    std::puts("served expert table, profile warming and LFU refill passed");
+    // Visit-weighted ROI allocation: looped layers (3 visits/token) must receive more hot slots than
+    // single-visit layers under a constrained VRAM budget.
+    {
+        std::vector<std::size_t> sb = {4300000, 4300000, 8100000};
+        std::vector<int> vis = {3, 1, 1};
+        const auto hot = ik2::allocate_served_hot_slots(sb, vis, 128, 300ULL * 1024 * 1024);
+        if (!(hot[0] > hot[1] && hot[1] >= hot[2] && hot[0] >= 40)) {
+            std::fprintf(stderr, "visit-weighted hot allocation failed: [%d, %d, %d]\n", hot[0], hot[1], hot[2]);
+            return 1;
+        }
+        std::size_t used = 0;
+        for (int l = 0; l < 3; ++l) used += std::size_t(hot[l]) * sb[l];
+        if (used > 300ULL * 1024 * 1024) {
+            std::fprintf(stderr, "hot allocation exceeded budget\n");
+            return 1;
+        }
+    }
+
+    std::puts("served expert table, profile warming, visit-weighted allocation and LFU refill passed");
 }

@@ -26,15 +26,25 @@ struct ServedExperts {
         CU(cudaMallocHost(&host, entries * sizeof(*host)));
         records = dalloc<int>(c.n_visit * c.K);
         CU(cudaMallocHost(&published, c.n_visit * c.K * sizeof(int)));
-        size_t reserve_bytes = 0, layer_sum = 0;
-        for (auto& v : m.V) reserve_bytes += c.K * m.L[v.l].slot_bytes;
-        for (auto& ly : m.L) layer_sum += ly.slot_bytes;
+        size_t reserve_bytes = 0;
+        std::vector<size_t> layer_sb(c.n_layer, 0);
+        std::vector<int> layer_vis(c.n_layer, 0);
+        for (auto& v : m.V) {
+            reserve_bytes += c.K * m.L[v.l].slot_bytes;
+            ++layer_vis[v.l];
+        }
+        for (int l = 0; l < c.n_layer; ++l) layer_sb[l] = m.L[l].slot_bytes;
         if (budget < reserve_bytes) die("--cache-gb cannot hold the per-visit expert reserves");
-        const int hot = int(std::min<size_t>(c.E, (budget - reserve_bytes) / layer_sum));
         const bool have_profile = counts.size() == (size_t)c.n_layer * c.E;
-        int offset = 0;
+        const auto hot_per_layer = ik2::allocate_served_hot_slots(
+            layer_sb, layer_vis, c.E, budget - reserve_bytes, have_profile ? counts.data() : nullptr);
+        int offset = 0, hot_min = c.E, hot_max = 0, hot_total = 0;
         for (int l = 0; l < c.n_layer; ++l) {
             auto& ly = m.L[l];
+            const int hot = hot_per_layer[l];
+            hot_min = std::min(hot_min, hot);
+            hot_max = std::max(hot_max, hot);
+            hot_total += hot;
             int reserve = c.K * (l >= c.core0 && l < c.core1 ? c.n_pass : 1);
             int n = hot + reserve;
             uint8_t* cold;
@@ -55,8 +65,8 @@ struct ServedExperts {
             offset += c.E + reserve;
         }
         CU(cudaMemcpy(device, host, entries * sizeof(*host), cudaMemcpyHostToDevice));
-        std::printf("GPU-served experts: %d hot slots per layer (%s), %d visit reserves\n", hot,
-                    have_profile ? "warmed from profile" : "cold", c.n_visit * c.K);
+        std::printf("GPU-served experts: %d hot slots (%d..%d per layer, %s), %d visit reserves\n", hot_total,
+                    hot_min, hot_max, have_profile ? "warmed from profile" : "cold", c.n_visit * c.K);
     }
 
     void finish(Model& m, Work& w) {

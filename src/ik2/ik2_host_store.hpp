@@ -104,6 +104,50 @@ inline size_t default_host_ram_budget(const HostRamInfo& info = query_host_ram()
     return info.avail > headroom ? info.avail - headroom : 0;
 }
 
+// Query real GPU-wide physical free VRAM via NVML on Windows WDDM (where cudaMemGetInfo can omit
+// VRAM held by other desktop processes like browsers/compositors). Returns 0 if NVML is unavailable.
+inline size_t query_win32_nvml_free_vram(const char* pci_bus_id, unsigned int fallback_index = 0) {
+#ifdef _WIN32
+    struct NvmlMem {
+        unsigned long long total;
+        unsigned long long free;
+        unsigned long long used;
+    };
+    using InitFn = int (*)(void);
+    using ShutFn = int (*)(void);
+    using ByPciFn = int (*)(const char*, void**);
+    using ByIdxFn = int (*)(unsigned int, void**);
+    using MemFn = int (*)(void*, NvmlMem*);
+
+    HMODULE lib = LoadLibraryA("nvml.dll");
+    if (!lib) lib = LoadLibraryA("C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+    if (!lib) return 0;
+
+    size_t free_bytes = 0;
+    auto init_fn = reinterpret_cast<InitFn>(GetProcAddress(lib, "nvmlInit_v2"));
+    auto shut_fn = reinterpret_cast<ShutFn>(GetProcAddress(lib, "nvmlShutdown"));
+    auto by_pci = reinterpret_cast<ByPciFn>(GetProcAddress(lib, "nvmlDeviceGetHandleByPciBusId_v2"));
+    auto by_idx = reinterpret_cast<ByIdxFn>(GetProcAddress(lib, "nvmlDeviceGetHandleByIndex_v2"));
+    auto mem_fn = reinterpret_cast<MemFn>(GetProcAddress(lib, "nvmlDeviceGetMemoryInfo"));
+    if (init_fn && shut_fn && mem_fn && init_fn() == 0) {
+        void* dev = nullptr;
+        int rc = (pci_bus_id && pci_bus_id[0] && by_pci) ? by_pci(pci_bus_id, &dev) : -1;
+        if ((rc != 0 || !dev) && by_idx) rc = by_idx(fallback_index, &dev);
+        if (rc == 0 && dev) {
+            NvmlMem m{};
+            if (mem_fn(dev, &m) == 0 && m.free > 0) free_bytes = static_cast<size_t>(m.free);
+        }
+        shut_fn();
+    }
+    FreeLibrary(lib);
+    return free_bytes;
+#else
+    (void)pci_bus_id;
+    (void)fallback_index;
+    return 0;
+#endif
+}
+
 // Thread-safe random-access file reader that bypasses the OS page cache when supported
 // (FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED on Windows, O_DIRECT on Linux).
 class DirectFile {

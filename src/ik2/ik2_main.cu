@@ -6114,11 +6114,27 @@ int main(int argc, char** argv) {
     }
     ExpertCache& EC = g_dev[d].EC;
     CU(cudaMemGetInfo(&fr, &tot));
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+    {
+        // On Windows WDDM, cudaMemGetInfo can omit VRAM held by other desktop processes (browser, DWM, etc.),
+        // which would silently spill allocations into Shared GPU Memory. Clamp to NVML's real physical free VRAM.
+        char pci_id[64] = {};
+        if (cudaDeviceGetPCIBusId(pci_id, sizeof(pci_id), d) != cudaSuccess) pci_id[0] = '\0';
+        const size_t nvml_free = ik2::tier::query_win32_nvml_free_vram(pci_id, (unsigned int)d);
+        if (nvml_free > 0 && nvml_free < fr) fr = nvml_free;
+    }
+#endif
     fr = free_for_budget(fr);
     // (what is left free: adaptive headroom beside a cache that streams experts in and out, 512 MiB-2 GiB so
-    //  12 GB cards keep more room for experts; 256 MiB when every expert stays in VRAM)
+    //  12 GB cards keep more room for experts; on Windows WDDM, GPU-served mode also keeps >= 1 GiB of real
+    //  physical VRAM free so the compositor/browser never triggers silent eviction into Shared GPU Memory)
     const size_t stream_room = std::min<size_t>(size_t{2} << 30, std::max<size_t>(size_t{512} << 20, tot / 16));
-    const size_t room = g_fast_want ? (size_t) 256 << 20 : stream_room;
+#ifdef _WIN32
+    const size_t served_room = std::max<size_t>(stream_room, size_t{1024} << 20);
+#else
+    const size_t served_room = stream_room;
+#endif
+    const size_t room = gpu_served ? served_room : (g_fast_want ? (size_t) 256 << 20 : stream_room);
     const size_t budget = std::min(cache_limit, fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     size_t prefill_budget = budget;

@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <numeric>
 #include <vector>
 
@@ -29,6 +31,76 @@ inline std::vector<int> rank_hot_experts(const uint64_t* layer_counts, int exper
     }
     ord.resize(k);
     return ord;
+}
+
+// Allocate per-layer hot expert slot counts within `hot_budget` bytes by greedily maximizing
+// expected decode time saved per byte of VRAM: looped layers (visited multiple times per token)
+// and higher-frequency profile experts receive proportionally more VRAM slots.
+inline std::vector<int> allocate_served_hot_slots(const std::vector<std::size_t>& slot_bytes,
+                                                  const std::vector<int>& visits_per_token, int experts,
+                                                  std::size_t hot_budget, const uint64_t* counts = nullptr) {
+    const int n_layer = int(slot_bytes.size());
+    std::vector<int> hot(n_layer, 0);
+    if (n_layer == 0 || experts <= 0 || hot_budget == 0) return hot;
+
+    std::size_t full_need = 0;
+    for (int l = 0; l < n_layer; ++l) full_need += std::size_t(experts) * slot_bytes[l];
+    if (hot_budget >= full_need) {
+        std::fill(hot.begin(), hot.end(), experts);
+        return hot;
+    }
+
+    // Zipf prior blended with empirical profile frequencies so unseen prompts still get balanced coverage.
+    std::vector<double> zipf(experts, 0.0);
+    double zipf_sum = 0.0;
+    for (int k = 0; k < experts; ++k) {
+        zipf[k] = 1.0 / std::pow(double(k + 1), 0.85);
+        zipf_sum += zipf[k];
+    }
+    for (double& v : zipf) v /= zipf_sum;
+
+    std::vector<std::vector<double>> gain(n_layer, std::vector<double>(experts, 0.0));
+    for (int l = 0; l < n_layer; ++l) {
+        std::vector<double> emp;
+        double sum = 0.0;
+        if (counts) {
+            emp.resize(experts);
+            for (int e = 0; e < experts; ++e) {
+                emp[e] = double(counts[std::size_t(l) * experts + e]);
+                sum += emp[e];
+            }
+            if (sum > 0.0) {
+                std::sort(emp.begin(), emp.end(), std::greater<double>());
+                for (double& v : emp) v /= sum;
+            }
+        }
+        const double vis = double(std::max(1, visits_per_token[l]));
+        const double mb = double(std::max<std::size_t>(1, slot_bytes[l])) / 1048576.0;
+        // Bandwidth term (slot_bytes cancels) + small per-miss fixed-overhead term (~0.5 MiB equivalent).
+        const double byte_factor = 1.0 + 0.5 / std::max(0.5, mb);
+        for (int k = 0; k < experts; ++k) {
+            const double p = (sum > 0.0) ? (0.7 * emp[k] + 0.3 * zipf[k]) : zipf[k];
+            gain[l][k] = vis * p * byte_factor;
+        }
+    }
+
+    std::size_t rem = hot_budget;
+    for (;;) {
+        int best_l = -1;
+        double best_g = -1.0;
+        for (int l = 0; l < n_layer; ++l) {
+            if (hot[l] >= experts || slot_bytes[l] > rem) continue;
+            const double g = gain[l][hot[l]];
+            if (g > best_g) {
+                best_g = g;
+                best_l = l;
+            }
+        }
+        if (best_l < 0) break;
+        ++hot[best_l];
+        rem -= slot_bytes[best_l];
+    }
+    return hot;
 }
 
 // Each reserve is dedicated to one router pick of one physical layer visit.

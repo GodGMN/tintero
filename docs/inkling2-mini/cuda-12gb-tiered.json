@@ -7,7 +7,7 @@
     "--max-context",
     "32768",
     "--chunk",
-    "1024"
+    "512"
   ],
   "env": {
     "IK2_KV": "fp4-global",
