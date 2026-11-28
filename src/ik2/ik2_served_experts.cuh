@@ -36,8 +36,9 @@ struct ServedExperts {
             auto& ly = m.L[l];
             int reserve = c.K * (l >= c.core0 && l < c.core1 ? c.n_pass : 1);
             int n = hot + reserve;
-            uint8_t* cold;
-            CU(cudaHostGetDevicePointer(&cold, const_cast<uint8_t*>(ly.host[0]), 0));
+            void* cold_vp = nullptr;
+            CU(cudaHostGetDevicePointer(&cold_vp, const_cast<uint8_t*>(ly.host[0]), 0));
+            uint8_t* cold = static_cast<uint8_t*>(cold_vp);
             if (ly.slot_bytes % 16) die("GPU-served experts require 16-byte aligned expert blobs");
             layers.push_back({ik2::ServedSlots(n, reserve), cold, dalloc<uint8_t>(n * ly.slot_bytes), ly.slot_bytes, offset});
             auto& s = layers.back();

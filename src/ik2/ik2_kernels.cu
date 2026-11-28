@@ -1198,7 +1198,7 @@ __device__ __forceinline__ void fa_load_tile_wg(uint16_t* Ks, uint16_t* Vs, cons
 __device__ __forceinline__ uint2 kv_half4(const Fp4KvBlock* cache, size_t element) {
     const auto& block = cache[element / 32];
     uint16_t codes;
-    std::memcpy(&codes, block.pairs + (element % 32) / 2, sizeof(codes));
+    __builtin_memcpy(&codes, block.pairs + (element % 32) / 2, sizeof(codes));
 #if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
     const __half2 scale = __half2half2(__ushort_as_half(block.scale));
     auto pair = [&](uint8_t byte) {
@@ -6199,7 +6199,7 @@ __global__ void select_sparse_pages(const uint16_t* q, const uint8_t* kc, int gr
         for (int sample = 16; sample < kSparsePageSize; sample += 32) {
             const size_t row = (size_t)(page * kSparsePageSize + sample) * Hkv + head;
             uint32_t bytes;
-            std::memcpy(&bytes, kc + row * 128 + lane * 4, sizeof(bytes));
+            __builtin_memcpy(&bytes, kc + row * 128 + lane * 4, sizeof(bytes));
             const float2 a = e4m3fnx2_to_f2((uint16_t)bytes), b = e4m3fnx2_to_f2(bytes >> 16);
             for (int h = 0; h < group; ++h) {
                 const uint16_t* x = q + (head * group + h) * 128 + lane * 4;
