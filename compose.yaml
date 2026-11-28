@@ -1,0 +1,43 @@
+x-tintero: &tintero
+  init: true
+  ports:
+    - "127.0.0.1:${TINTERO_HTTP_PORT:-8085}:8080"
+  volumes:
+    - type: bind
+      source: ${TINTERO_MODELS_DIR:-./models}
+      target: /opt/tintero/models
+      read_only: true
+      bind:
+        create_host_path: false
+    - "${TINTERO_TOKENIZER_DIR:-./ik2}:/opt/tintero/ik2:ro"
+    - tokenizer-cache:/opt/tintero/.cache/tokenizers
+
+services:
+  cuda:
+    <<: *tintero
+    profiles: [cuda]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cuda
+    gpus: all
+    environment:
+      - TINTERO_CONFIG=${TINTERO_CONFIG:-docs/inkling2-mini/cuda-24gb-fp4.json}
+      - TINTERO_MODEL
+      - IK2_ABLATE_MODE
+
+  hip:
+    <<: *tintero
+    profiles: [hip]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.hip
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    environment:
+      - TINTERO_CONFIG=${TINTERO_CONFIG:-docs/inkling2-mini/ik2-mini-gfx1100.json}
+      - TINTERO_MODEL
+      - IK2_ABLATE_MODE
+
+volumes:
+  tokenizer-cache:

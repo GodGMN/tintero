@@ -21,7 +21,7 @@ jobs:
       - name: Python packages
         run: |
           python -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet gguf numpy pillow requests jinja2 regex pyyaml tqdm psutil 'jsonschema>=4.18,<5'
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet -r docker/requirements.txt
       - name: The AMD build's CUDA names all mapped (include/strata/hip_compat)
         run: '"$RUNNER_TEMP/venv/bin/python" tools/check_hip_compat.py'
       - name: Configure without a GPU SDK
@@ -30,6 +30,11 @@ jobs:
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
+      - name: Docker startup and Compose profiles
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" tests/docker_startup_test.py
+          docker compose --profile cuda config --quiet
+          docker compose --profile hip config --quiet
       - name: Decode comparison and web client tests
         run: |
           "$RUNNER_TEMP/venv/bin/python" tests/ik2_compare_decode_test.py

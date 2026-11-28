@@ -989,6 +989,7 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
+        self.protocol_ready = False
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
         self.model_path = paths.get("--native") or paths.get("--pack") or paths.get("--model", "pack/full")
@@ -1054,6 +1055,7 @@ class StrataEngine:
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
+        self.protocol_ready = True
 
     def _context_cost(self, offset: int):
         """What this start's context costs in VRAM, from the GLM engine's own start lines ("CUDA0 VRAM before the
@@ -1198,6 +1200,9 @@ class StrataEngine:
 
     def alive(self) -> bool:
         return not getattr(self, "ended", False) and self.proc.poll() is None
+
+    def ready(self) -> bool:
+        return self.protocol_ready and self.alive()
 
     def _activity(self):
         """(CPU seconds, disk bytes read + written) the engine process has used so far; None without psutil."""
@@ -6406,8 +6411,11 @@ def make_handler(svc: Service):
                 # Hy4-flash alone: its two levels (the page offers these and no others)
                 levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) else None
                 cache_slots = getattr(svc.engine, "info", {}).get("cache_slots")
-                self._json(200, {"status": "updating" if svc.updater.busy() else
-                                           "reloading" if svc.reloading() else "ok",
+                status = "updating" if svc.updater.busy() else "reloading" if svc.reloading() else "ok"
+                engine_ready = getattr(svc.engine, "ready", getattr(svc.engine, "alive", None))
+                ready = (status == "ok" and not svc.unloaded and svc.engine.max_context > 0
+                         and (engine_ready is None or engine_ready()))
+                self._json(200, {"status": status, "ready": ready,
                                  "max_context": svc.engine.max_context, "model": svc.model,
                                  **({"cache_slots": cache_slots} if cache_slots is not None else {}),
                                  "max_text_file": text_file_limit(svc.engine.max_context),

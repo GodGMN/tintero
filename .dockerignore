@@ -5,3 +5,5 @@
 build
 build-*
 models
+ik2
+.cache
